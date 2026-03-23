@@ -691,7 +691,6 @@ impl Insurance {
         monthly_premium: i128,
         coverage_amount: i128,
         external_ref: Option<String>,
-    ) -> u32 {
     ) -> Result<u32, InsuranceError> {
         owner.require_auth();
         Self::require_not_paused(&env, pause_functions::CREATE_POLICY)?;
@@ -1115,31 +1114,15 @@ impl Insurance {
         next_due: u64,
         interval: u64,
     ) -> Result<u32, InsuranceError> {
-        // Changed to Result
         owner.require_auth();
         Self::require_not_paused(&env, pause_functions::CREATE_SCHED)?;
 
-        let name = String::from_str(&env, "Health Insurance");
-        let coverage_type = String::from_str(&env, "health");
-        let monthly_premium = 100;
-        let coverage_amount = 10000;
-        let external_ref = Some(String::from_str(&env, "POLICY-EXT-1"));
-
-        let policy_id = client.create_policy(
-            &owner,
-            &name,
-            &coverage_type,
-            &monthly_premium,
-            &coverage_amount,
-            &external_ref,
-        );
         let mut policies: Map<u32, InsurancePolicy> = env
             .storage()
             .instance()
             .get(&symbol_short!("POLICIES"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut policy = policies.get(policy_id).unwrap_or_else(|| panic!("Policy not found"));
         let mut policy = policies
             .get(policy_id)
             .ok_or(InsuranceError::PolicyNotFound)?;
@@ -1148,17 +1131,6 @@ impl Insurance {
             return Err(InsuranceError::Unauthorized);
         }
 
-        let policy = client.get_policy(&policy_id).unwrap();
-        assert_eq!(policy.id, 1);
-        assert_eq!(policy.owner, owner);
-        assert_eq!(policy.name, name);
-        assert_eq!(policy.external_ref, external_ref);
-        assert_eq!(policy.coverage_type, coverage_type);
-        assert_eq!(policy.monthly_premium, monthly_premium);
-        assert_eq!(policy.coverage_amount, coverage_amount);
-        assert!(policy.active);
-        assert_eq!(policy.next_payment_date, 1000000000 + (30 * 86400));
-    }
         let current_time = env.ledger().timestamp();
         if next_due <= current_time {
             return Err(InsuranceError::InvalidTimestamp);
@@ -1172,8 +1144,6 @@ impl Insurance {
             .get(&symbol_short!("PREM_SCH"))
             .unwrap_or_else(|| Map::new(&env));
 
-        client.create_policy(&owner, &name, &coverage_type, &0, &10000, &None);
-    }
         let next_schedule_id = env
             .storage()
             .instance()
@@ -1196,8 +1166,6 @@ impl Insurance {
 
         policy.schedule_id = Some(next_schedule_id);
 
-        client.create_policy(&owner, &name, &coverage_type, &-100, &10000, &None);
-    }
         schedules.set(next_schedule_id, schedule);
         env.storage()
             .instance()
@@ -1244,7 +1212,6 @@ impl Insurance {
             .get(&symbol_short!("PREM_SCH"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut schedule = schedules.get(schedule_id).unwrap_or_else(|| panic!("Schedule not found"));
         let mut schedule = schedules
             .get(schedule_id)
             .ok_or(InsuranceError::PolicyNotFound)?;
