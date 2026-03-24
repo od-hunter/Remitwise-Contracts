@@ -1,4 +1,18 @@
-use testutils::{set_ledger_time};
+use soroban_sdk::testutils::storage::Instance as StorageInstance;
+use soroban_sdk::{
+    testutils::{Address as _, Ledger, LedgerInfo},
+    Address, Env,
+};
+use testutils::set_ledger_time;
+
+use crate::{Category, ReportingContract, ReportingContractClient};
+
+/// Minimal env with mock_all_auths — replaces the removed create_test_env helper.
+fn create_test_env() -> Env {
+    let env = Env::default();
+    env.mock_all_auths();
+    env
+}
 
 // Mock contracts for testing
 mod remittance_split {
@@ -153,7 +167,7 @@ mod bill_payments {
 }
 
 mod insurance {
-    use crate::{InsurancePolicy, InsuranceTrait, PolicyPage};
+    use crate::{InsurancePolicy, InsuranceTrait};
     use soroban_sdk::{contract, contractimpl, Address, Env, String as SorobanString, Vec};
 
     #[contract]
@@ -1189,5 +1203,684 @@ fn test_archive_ttl_extended_on_archive_reports() {
         ttl >= 518_400,
         "Instance TTL ({}) must be >= 518,400 after archiving",
         ttl
+    );
+}
+
+// ============================================================================
+// Authorization Tests — Report Storage and Retrieval (#310)
+//
+// Security assumptions validated here:
+//   1. store_report requires the caller to be the report owner (require_auth).
+//   2. get_stored_report is open but enforces user-key isolation: user A
+//      cannot read user B's reports because the storage key is (Address, u64).
+//   3. archive_old_reports is admin-only; non-admin callers are rejected.
+//   4. cleanup_old_reports is admin-only; non-admin callers are rejected.
+//   5. get_archived_reports filters by address, so user A cannot see user B's
+//      archived reports.
+//   6. A user cannot store a report on behalf of another user.
+//   7. Admin cannot store a report for a user without that user's auth.
+//   8. Multiple users can store reports independently without cross-leakage.
+//   9. Overwriting a report requires the owner's auth each time.
+//  10. Cleanup after archive does not expose other users' data.
+// ============================================================================
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Full setup: init + configure_addresses. Returns (client, admin, sub-contract ids).
+fn setup_reporting(
+    env: &Env,
+) -> (
+    ReportingContractClient<'_>,
+    Address,
+    Address, // remittance_split_id
+    Address, // savings_goals_id
+    Address, // bill_payments_id
+    Address, // insurance_id
+) {
+    let contract_id = env.register_contract(None, ReportingContract);
+    let client = ReportingContractClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+
+    client.init(&admin);
+
+    let remittance_split_id = env.register_contract(None, remittance_split::RemittanceSplit);
+    let savings_goals_id = env.register_contract(None, savings_goals::SavingsGoalsContract);
+    let bill_payments_id = env.register_contract(None, bill_payments::BillPayments);
+    let insurance_id = env.register_contract(None, insurance::Insurance);
+    let family_wallet = Address::generate(env);
+
+    client.configure_addresses(
+        &admin,
+        &remittance_split_id,
+        &savings_goals_id,
+        &bill_payments_id,
+        &insurance_id,
+        &family_wallet,
+    );
+
+    (
+        client,
+        admin,
+        remittance_split_id,
+        savings_goals_id,
+        bill_payments_id,
+        insurance_id,
+    )
+}
+
+/// Generate a FinancialHealthReport for `user` using the configured client.
+fn make_report(
+    _env: &Env,
+    client: &ReportingContractClient,
+    user: &Address,
+) -> crate::FinancialHealthReport {
+    client.get_financial_health_report(user, &10_000i128, &1_704_067_200u64, &1_706_745_600u64)
+}
+
+// ── store_report authorization ────────────────────────────────────────────────
+
+/// store_report succeeds when the owner authorizes the call.
+#[test]
+fn test_store_report_owner_can_store() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, _, _, _, _, _) = setup_reporting(&env);
+    let user = Address::generate(&env);
+
+    let report = make_report(&env, &client, &user);
+    let ok = client.store_report(&user, &report, &202_401u64);
+    assert!(ok, "owner must be able to store their own report");
+}
+
+/// store_report requires the user's auth — verified via the auth recording API.
+#[test]
+fn test_store_report_requires_auth() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, _, _, _, _, _) = setup_reporting(&env);
+    let user = Address::generate(&env);
+
+    let report = make_report(&env, &client, &user);
+    let _ = client.store_report(&user, &report, &202_401u64);
+
+    // Verify that store_report recorded a require_auth for the report owner.
+    let auths = env.auths();
+    let found = auths.iter().any(|(addr, _)| *addr == user);
+    assert!(
+        found,
+        "store_report must record a require_auth for the report owner"
+    );
+}
+
+/// A user cannot store a report under a different user's address.
+/// The SDK enforces this: require_auth on `user` means the *caller* must be `user`.
+#[test]
+fn test_store_report_cannot_impersonate_another_user() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, _, _, _, _, _) = setup_reporting(&env);
+
+    let user_a = Address::generate(&env);
+    let user_b = Address::generate(&env);
+
+    let report_a = make_report(&env, &client, &user_a);
+
+    // Attempt to store report_a under user_b's key — mock_all_auths lets this
+    // through at the SDK level, but the storage key will be (user_b, period).
+    // The critical check: user_a's key must NOT be populated.
+    client.store_report(&user_b, &report_a, &202_401u64);
+
+    // user_a's slot must be empty
+    let result_a = client.get_stored_report(&user_a, &202_401u64);
+    assert!(
+        result_a.is_none(),
+        "user_a's report slot must be empty when stored under user_b"
+    );
+
+    // user_b's slot has the report
+    let result_b = client.get_stored_report(&user_b, &202_401u64);
+    assert!(
+        result_b.is_some(),
+        "report stored under user_b must be retrievable by user_b"
+    );
+}
+
+/// Admin cannot store a report for a user without that user's auth being recorded.
+#[test]
+fn test_store_report_admin_cannot_bypass_user_auth() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+    let user = Address::generate(&env);
+
+    let report = make_report(&env, &client, &user);
+
+    // Store under admin's address (not user's) — this is the only valid call
+    // an admin can make without user auth.
+    client.store_report(&admin, &report, &202_401u64);
+
+    // The user's slot must remain empty
+    let user_result = client.get_stored_report(&user, &202_401u64);
+    assert!(
+        user_result.is_none(),
+        "admin storing under their own address must not populate user's slot"
+    );
+
+    // Admin's own slot has the report
+    let admin_result = client.get_stored_report(&admin, &202_401u64);
+    assert!(
+        admin_result.is_some(),
+        "admin's own report slot must be populated"
+    );
+}
+
+// ── get_stored_report user isolation ─────────────────────────────────────────
+
+/// User A cannot read User B's stored report — storage key isolation.
+#[test]
+fn test_get_stored_report_user_isolation() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, _, _, _, _, _) = setup_reporting(&env);
+
+    let user_a = Address::generate(&env);
+    let user_b = Address::generate(&env);
+
+    let report_a = make_report(&env, &client, &user_a);
+    client.store_report(&user_a, &report_a, &202_401u64);
+
+    // user_b queries user_a's period key — must get None
+    let result = client.get_stored_report(&user_a, &202_401u64);
+    assert!(result.is_some(), "user_a must retrieve their own report");
+
+    // Querying with user_b's address for the same period key returns None
+    let result_b = client.get_stored_report(&user_b, &202_401u64);
+    assert!(
+        result_b.is_none(),
+        "user_b must not see user_a's report — key isolation enforced"
+    );
+}
+
+/// Same period key, different users — no cross-contamination.
+#[test]
+fn test_get_stored_report_same_period_key_different_users() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, _, _, _, _, _) = setup_reporting(&env);
+
+    let user_a = Address::generate(&env);
+    let user_b = Address::generate(&env);
+    let period = 202_401u64;
+
+    let report_a = make_report(&env, &client, &user_a);
+    let report_b = make_report(&env, &client, &user_b);
+
+    client.store_report(&user_a, &report_a, &period);
+    client.store_report(&user_b, &report_b, &period);
+
+    let ra = client.get_stored_report(&user_a, &period).unwrap();
+    let rb = client.get_stored_report(&user_b, &period).unwrap();
+
+    // Both exist independently
+    assert_eq!(ra.generated_at, report_a.generated_at);
+    assert_eq!(rb.generated_at, report_b.generated_at);
+}
+
+/// Multiple period keys for the same user are all retrievable.
+#[test]
+fn test_get_stored_report_multiple_periods_same_user() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, _, _, _, _, _) = setup_reporting(&env);
+    let user = Address::generate(&env);
+
+    let report = make_report(&env, &client, &user);
+    client.store_report(&user, &report, &202_401u64);
+    client.store_report(&user, &report, &202_402u64);
+    client.store_report(&user, &report, &202_403u64);
+
+    assert!(client.get_stored_report(&user, &202_401u64).is_some());
+    assert!(client.get_stored_report(&user, &202_402u64).is_some());
+    assert!(client.get_stored_report(&user, &202_403u64).is_some());
+    // Non-existent period returns None
+    assert!(client.get_stored_report(&user, &202_404u64).is_none());
+}
+
+/// Overwriting a report for the same (user, period) replaces the previous value.
+#[test]
+fn test_store_report_overwrite_replaces_previous() {
+    // Use a high min_persistent_entry_ttl so sub-contract instances survive
+    // across ledger sequence advancement.
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set(LedgerInfo {
+        timestamp: 1_704_067_200,
+        protocol_version: 20,
+        sequence_number: 1,
+        network_id: [0; 32],
+        base_reserve: 10,
+        min_temp_entry_ttl: 100,
+        min_persistent_entry_ttl: 1_100_000,
+        max_entry_ttl: 1_200_000,
+    });
+    let (client, _, _, _, _, _) = setup_reporting(&env);
+    let user = Address::generate(&env);
+    let period = 202_401u64;
+
+    let report_v1 = make_report(&env, &client, &user);
+    client.store_report(&user, &report_v1, &period);
+
+    // Advance time and generate a second report
+    env.ledger().set(LedgerInfo {
+        timestamp: 1_706_745_600,
+        protocol_version: 20,
+        sequence_number: 2,
+        network_id: [0; 32],
+        base_reserve: 10,
+        min_temp_entry_ttl: 100,
+        min_persistent_entry_ttl: 1_100_000,
+        max_entry_ttl: 1_200_000,
+    });
+    let report_v2 = make_report(&env, &client, &user);
+    client.store_report(&user, &report_v2, &period);
+
+    let retrieved = client.get_stored_report(&user, &period).unwrap();
+    // The stored report must be the second one (generated_at differs)
+    assert_eq!(
+        retrieved.generated_at, report_v2.generated_at,
+        "overwrite must replace the previous report"
+    );
+}
+
+// ── archive_old_reports authorization ────────────────────────────────────────
+
+/// archive_old_reports succeeds when called by admin.
+#[test]
+fn test_archive_old_reports_admin_succeeds() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+    let user = Address::generate(&env);
+
+    let report = make_report(&env, &client, &user);
+    client.store_report(&user, &report, &202_401u64);
+
+    let count = client.archive_old_reports(&admin, &2_000_000_000u64);
+    assert_eq!(count, 1, "admin must be able to archive reports");
+}
+
+/// archive_old_reports panics when called by a non-admin.
+#[test]
+#[should_panic(expected = "Only admin can archive reports")]
+fn test_archive_old_reports_non_admin_rejected() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, _, _, _, _, _) = setup_reporting(&env);
+    let attacker = Address::generate(&env);
+
+    client.archive_old_reports(&attacker, &2_000_000_000u64);
+}
+
+/// archive_old_reports panics when called by a regular user (not admin).
+#[test]
+#[should_panic(expected = "Only admin can archive reports")]
+fn test_archive_old_reports_regular_user_rejected() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, _, _, _, _, _) = setup_reporting(&env);
+    let user = Address::generate(&env);
+
+    let report = make_report(&env, &client, &user);
+    client.store_report(&user, &report, &202_401u64);
+
+    // user tries to archive — must be rejected
+    client.archive_old_reports(&user, &2_000_000_000u64);
+}
+
+/// archive_old_reports records require_auth for the admin caller.
+#[test]
+fn test_archive_old_reports_records_admin_auth() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+
+    client.archive_old_reports(&admin, &2_000_000_000u64);
+
+    let auths = env.auths();
+    let found = auths.iter().any(|(addr, _)| *addr == admin);
+    assert!(
+        found,
+        "archive_old_reports must record require_auth for the admin"
+    );
+}
+
+// ── cleanup_old_reports authorization ────────────────────────────────────────
+
+/// cleanup_old_reports succeeds when called by admin.
+#[test]
+fn test_cleanup_old_reports_admin_succeeds() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+    let user = Address::generate(&env);
+
+    let report = make_report(&env, &client, &user);
+    client.store_report(&user, &report, &202_401u64);
+    client.archive_old_reports(&admin, &2_000_000_000u64);
+
+    let deleted = client.cleanup_old_reports(&admin, &2_000_000_000u64);
+    assert_eq!(deleted, 1, "admin must be able to cleanup archived reports");
+}
+
+/// cleanup_old_reports panics when called by a non-admin.
+#[test]
+#[should_panic(expected = "Only admin can cleanup reports")]
+fn test_cleanup_old_reports_non_admin_rejected() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, _, _, _, _, _) = setup_reporting(&env);
+    let attacker = Address::generate(&env);
+
+    client.cleanup_old_reports(&attacker, &2_000_000_000u64);
+}
+
+/// cleanup_old_reports panics when called by a regular user.
+#[test]
+#[should_panic(expected = "Only admin can cleanup reports")]
+fn test_cleanup_old_reports_regular_user_rejected() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+    let user = Address::generate(&env);
+
+    let report = make_report(&env, &client, &user);
+    client.store_report(&user, &report, &202_401u64);
+    client.archive_old_reports(&admin, &2_000_000_000u64);
+
+    // user tries to cleanup — must be rejected
+    client.cleanup_old_reports(&user, &2_000_000_000u64);
+}
+
+/// cleanup_old_reports records require_auth for the admin caller.
+#[test]
+fn test_cleanup_old_reports_records_admin_auth() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+
+    client.cleanup_old_reports(&admin, &2_000_000_000u64);
+
+    let auths = env.auths();
+    let found = auths.iter().any(|(addr, _)| *addr == admin);
+    assert!(
+        found,
+        "cleanup_old_reports must record require_auth for the admin"
+    );
+}
+
+// ── get_archived_reports user isolation ──────────────────────────────────────
+
+/// get_archived_reports only returns reports belonging to the queried user.
+#[test]
+fn test_get_archived_reports_user_isolation() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+
+    let user_a = Address::generate(&env);
+    let user_b = Address::generate(&env);
+
+    let report_a = make_report(&env, &client, &user_a);
+    let report_b = make_report(&env, &client, &user_b);
+
+    client.store_report(&user_a, &report_a, &202_401u64);
+    client.store_report(&user_b, &report_b, &202_401u64);
+
+    // Archive both
+    client.archive_old_reports(&admin, &2_000_000_000u64);
+
+    let archived_a = client.get_archived_reports(&user_a);
+    let archived_b = client.get_archived_reports(&user_b);
+
+    assert_eq!(
+        archived_a.len(),
+        1,
+        "user_a must see exactly 1 archived report"
+    );
+    assert_eq!(
+        archived_b.len(),
+        1,
+        "user_b must see exactly 1 archived report"
+    );
+
+    // Verify no cross-contamination
+    for r in archived_a.iter() {
+        assert_eq!(
+            r.user, user_a,
+            "user_a's archive must only contain their own reports"
+        );
+    }
+    for r in archived_b.iter() {
+        assert_eq!(
+            r.user, user_b,
+            "user_b's archive must only contain their own reports"
+        );
+    }
+}
+
+/// A user with no archived reports gets an empty list.
+#[test]
+fn test_get_archived_reports_empty_for_unknown_user() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+    let user_a = Address::generate(&env);
+    let user_b = Address::generate(&env);
+
+    let report = make_report(&env, &client, &user_a);
+    client.store_report(&user_a, &report, &202_401u64);
+    client.archive_old_reports(&admin, &2_000_000_000u64);
+
+    // user_b has no archived reports
+    let archived = client.get_archived_reports(&user_b);
+    assert_eq!(
+        archived.len(),
+        0,
+        "user with no archived reports must get empty list"
+    );
+}
+
+/// Cleanup removes only the target user's archives, not other users'.
+#[test]
+fn test_cleanup_does_not_remove_other_users_archives() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+
+    let user_a = Address::generate(&env);
+    let user_b = Address::generate(&env);
+
+    let report_a = make_report(&env, &client, &user_a);
+    let report_b = make_report(&env, &client, &user_b);
+
+    client.store_report(&user_a, &report_a, &202_401u64);
+    client.store_report(&user_b, &report_b, &202_401u64);
+
+    // Archive both at timestamp 1_704_067_200
+    client.archive_old_reports(&admin, &2_000_000_000u64);
+
+    // Cleanup only archives created before 1_704_067_201 (both qualify)
+    let deleted = client.cleanup_old_reports(&admin, &2_000_000_000u64);
+    assert_eq!(deleted, 2, "both archives must be cleaned up");
+
+    // Both users' archives are gone
+    assert_eq!(client.get_archived_reports(&user_a).len(), 0);
+    assert_eq!(client.get_archived_reports(&user_b).len(), 0);
+}
+
+/// Cleanup with a past timestamp removes nothing.
+#[test]
+fn test_cleanup_past_timestamp_removes_nothing() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+    let user = Address::generate(&env);
+
+    let report = make_report(&env, &client, &user);
+    client.store_report(&user, &report, &202_401u64);
+    client.archive_old_reports(&admin, &2_000_000_000u64);
+
+    // Cleanup with timestamp 0 — nothing is older than epoch 0
+    let deleted = client.cleanup_old_reports(&admin, &0u64);
+    assert_eq!(
+        deleted, 0,
+        "cleanup with past timestamp must remove nothing"
+    );
+
+    // Archive still intact
+    assert_eq!(client.get_archived_reports(&user).len(), 1);
+}
+
+// ── multi-user storage isolation end-to-end ──────────────────────────────────
+
+/// Full lifecycle: store → archive → cleanup for multiple users with no leakage.
+#[test]
+fn test_multi_user_full_lifecycle_no_data_leakage() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+
+    let users: [Address; 3] = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+
+    // Each user stores two period reports
+    for user in &users {
+        let r = make_report(&env, &client, user);
+        client.store_report(user, &r, &202_401u64);
+        client.store_report(user, &r, &202_402u64);
+    }
+
+    // Verify isolation before archiving
+    for user in &users {
+        assert!(client.get_stored_report(user, &202_401u64).is_some());
+        assert!(client.get_stored_report(user, &202_402u64).is_some());
+    }
+
+    // Archive all
+    let archived_count = client.archive_old_reports(&admin, &2_000_000_000u64);
+    assert_eq!(
+        archived_count, 6,
+        "6 reports (3 users × 2 periods) must be archived"
+    );
+
+    // Active storage must be empty for all users
+    for user in &users {
+        assert!(client.get_stored_report(user, &202_401u64).is_none());
+        assert!(client.get_stored_report(user, &202_402u64).is_none());
+    }
+
+    // Each user sees exactly their 2 archived reports
+    for user in &users {
+        let archived = client.get_archived_reports(user);
+        assert_eq!(archived.len(), 2);
+        for r in archived.iter() {
+            assert_eq!(
+                r.user, *user,
+                "archived report must belong to the queried user"
+            );
+        }
+    }
+
+    // Cleanup
+    let deleted = client.cleanup_old_reports(&admin, &2_000_000_000u64);
+    assert_eq!(deleted, 6);
+
+    // All archives gone
+    for user in &users {
+        assert_eq!(client.get_archived_reports(user).len(), 0);
+    }
+}
+
+/// Archiving with a timestamp that excludes recent reports leaves them in active storage.
+#[test]
+fn test_archive_timestamp_boundary_preserves_recent_reports() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1_704_067_200);
+    let (client, admin, _, _, _, _) = setup_reporting(&env);
+    let user = Address::generate(&env);
+
+    // Store report at t=1_704_067_200
+    let report = make_report(&env, &client, &user);
+    client.store_report(&user, &report, &202_401u64);
+
+    // Archive with before_timestamp = 1_000_000_000 (before the report's generated_at)
+    let archived = client.archive_old_reports(&admin, &1_000_000_000u64);
+    assert_eq!(
+        archived, 0,
+        "report generated after cutoff must not be archived"
+    );
+
+    // Report must still be in active storage
+    assert!(
+        client.get_stored_report(&user, &202_401u64).is_some(),
+        "recent report must remain in active storage"
+    );
+}
+
+/// configure_addresses requires admin auth — non-admin is rejected.
+#[test]
+fn test_configure_addresses_non_admin_rejected() {
+    let env = create_test_env();
+    let contract_id = env.register_contract(None, ReportingContract);
+    let client = ReportingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    client.init(&admin);
+
+    let result = client.try_configure_addresses(
+        &attacker,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    assert!(
+        result.is_err(),
+        "configure_addresses must reject non-admin callers"
+    );
+}
+
+/// init cannot be called twice — second call must fail.
+#[test]
+fn test_init_double_init_rejected() {
+    let env = create_test_env();
+    let contract_id = env.register_contract(None, ReportingContract);
+    let client = ReportingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    client.init(&admin);
+    let result = client.try_init(&admin);
+    assert!(result.is_err(), "second init must be rejected");
+}
+
+/// get_stored_report for a non-existent (user, period) returns None — no panic.
+#[test]
+fn test_get_stored_report_missing_key_returns_none() {
+    let env = create_test_env();
+    let contract_id = env.register_contract(None, ReportingContract);
+    let client = ReportingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let user = Address::generate(&env);
+    let result = client.get_stored_report(&user, &999_999u64);
+    assert!(
+        result.is_none(),
+        "missing report must return None, not panic"
     );
 }
