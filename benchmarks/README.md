@@ -1,27 +1,169 @@
-# Savings Goals Gas Benchmarks
+# Gas Benchmarking System
+
+This directory contains the gas benchmarking infrastructure for Remitwise smart contracts. The system tracks CPU and memory costs for critical operations to detect performance regressions early in development.
 
 ## Overview
-This document tracks the CPU and Memory resource consumption (gas benchmarking) for heavy operational paths in the `savings_goals` Soroban smart contract.
 
-## Test Instructions
-To reproduce these benchmark numbers locally, run the following command from the repository root:
-```bash
-RUST_TEST_THREADS=1 cargo test -p savings_goals --test gas_bench -- --nocapture
+Gas benchmarking helps ensure that contract operations remain efficient and predictable. Each benchmark measures:
+- **CPU Instructions**: Computational cost of operations
+- **Memory Usage**: Storage and temporary memory allocation costs
+
+## Structure
+
+```
+benchmarks/
+├── README.md           # This documentation
+├── baseline.json       # Baseline measurements for all operations
+├── thresholds.json     # Regression detection thresholds
+└── history/           # Historical benchmark data
 ```
 
-## Security Assumptions
-- **Execution Scaling Constraints**: Batch loops (`batch_add_to_goals`, `execute_due_savings_schedules`) constrain execution via maximum capacities (e.g., `MAX_BATCH_SIZE: u32 = 50`) ensuring transactions cannot exceed Soroban limits or induce Out of Gas errors.
-- **State Integrity**: No external untrusted contract interfaces are invoked during localized mass schedule executions, removing re-entrancy attack surfaces.
-- **Edge Cases**: `batch_add_to_goals` explicitly validates goals are owned by the `caller`. If a user injects an external goal ID via UI parameters, the batch transaction will hard panic and roll back with `Not owner of all goals`. `execute_due_savings_schedules` processes independent of caller allowing cron execution without unauthorized balance manipulation.
+## Configuration Files
 
-## Baseline Metrics & Regression Thresholds
-_Warning: If any future optimization exceeds these `CPU` or `Memory` ceilings by > 10%, a thorough regression review natively against `env.budget()` is mandatory._
+### baseline.json
+Contains baseline CPU and memory costs for each benchmarked operation. These values are updated when legitimate performance improvements are made.
 
-| Operation | Scenario | CPU Instructions | Memory Allocated | Status |
-| :--- | :--- | :---: | :---: | :---: |
-| `get_all_goals` | 100 goals | 2,976,312 | 540,833 | ✅ Verified |
-| `batch_add_to_goals` | 50 items | 3,037,951 | 615,851 | ✅ Verified |
-| `execute_due_savings_schedules` | 50 schedules | 3,178,232 | 701,755 | ✅ Verified |
-| `create_savings_schedule` | Single schedule | 106,701 | 19,795 | ✅ Verified |
+### thresholds.json
+Defines regression detection thresholds as percentage increases from baseline:
+- **default**: 10% increase triggers warning for most operations
+- **contract_specific**: Custom thresholds per contract
+- **method_specific**: Custom thresholds per method
 
-*Metrics extracted from local env budget execution tracker using host trace APIs.*
+## Running Benchmarks
+
+### Individual Contract Benchmarks
+```bash
+# Run remittance_split schedule operation benchmarks
+RUST_TEST_THREADS=1 cargo test -p remittance_split --test gas_bench -- --nocapture
+
+# Run bill_payments benchmarks
+RUST_TEST_THREADS=1 cargo test -p bill_payments --test gas_bench -- --nocapture
+```
+
+### All Benchmarks
+```bash
+# Run all gas benchmarks across contracts
+./scripts/run_all_benchmarks.sh
+```
+
+## Benchmark Output Format
+
+Each benchmark outputs JSON with the following structure:
+```json
+{
+  "contract": "remittance_split",
+  "method": "create_remittance_schedule", 
+  "scenario": "single_recurring_schedule",
+  "cpu": 12345,
+  "mem": 6789
+}
+```
+
+## Remittance Split Schedule Operations
+
+The remittance split contract includes comprehensive benchmarks for schedule lifecycle operations:
+
+### Create Operations
+- `create_remittance_schedule/single_recurring_schedule`: Basic schedule creation
+- `create_remittance_schedule/11th_schedule_with_existing`: Scaling with existing schedules
+
+### Modify Operations  
+- `modify_remittance_schedule/single_schedule_modification`: Update existing schedule
+
+### Cancel Operations
+- `cancel_remittance_schedule/single_schedule_cancellation`: Cancel active schedule
+
+### Query Operations
+- `get_remittance_schedules/empty_schedules`: Query with no schedules
+- `get_remittance_schedules/5_schedules_with_isolation`: Query with data isolation
+- `get_remittance_schedules/50_schedules_worst_case`: Worst-case query performance
+- `get_remittance_schedule/single_schedule_lookup`: Single schedule retrieval
+
+## Security Considerations
+
+All benchmarks include security validations:
+
+1. **Authorization**: Tests verify proper authentication and authorization
+2. **Data Isolation**: Ensures users can only access their own data
+3. **Input Validation**: Tests with valid parameters to ensure proper validation
+4. **Edge Cases**: Covers boundary conditions and error scenarios
+
+## Regression Detection
+
+The system automatically detects regressions by comparing current measurements against baselines:
+
+- **Green**: Within threshold (no action needed)
+- **Yellow**: Exceeds threshold but < 25% increase (review recommended)  
+- **Red**: > 25% increase (investigation required)
+
+## Adding New Benchmarks
+
+When adding new contract methods:
+
+1. **Create benchmark test** in `contracts/{contract}/tests/gas_bench.rs`
+2. **Add baseline entry** in `baseline.json` 
+3. **Set thresholds** in `thresholds.json` if non-standard
+4. **Document security assumptions** in test comments
+
+### Benchmark Test Template
+
+```rust
+/// Benchmark: {Operation description}
+/// Security: {Security validations performed}
+#[test]
+fn bench_{operation_name}() {
+    let env = bench_env();
+    let contract_id = env.register_contract(None, YourContract);
+    let client = YourContractClient::new(&env, &contract_id);
+
+    // Setup test data
+    let owner = <Address as AddressTrait>::generate(&env);
+    
+    let (cpu, mem, result) = measure(&env, || {
+        client.your_method(&owner, &param1, &param2)
+    });
+    
+    // Validate result
+    assert!(result.is_ok());
+
+    println!(
+        r#"{{"contract":"your_contract","method":"your_method","scenario":"test_scenario","cpu":{},"mem":{}}}"#,
+        cpu, mem
+    );
+}
+```
+
+## Best Practices
+
+1. **Consistent Environment**: Use `bench_env()` for reproducible conditions
+2. **Realistic Data**: Test with representative data sizes and patterns
+3. **Worst-Case Scenarios**: Include stress tests with maximum realistic loads
+4. **Security Validation**: Always verify security assumptions in benchmarks
+5. **Clear Naming**: Use descriptive scenario names that indicate test conditions
+
+## Monitoring and Alerts
+
+- Benchmark results are tracked in CI/CD pipelines
+- Significant regressions trigger build failures
+- Historical data enables trend analysis
+- Performance improvements can be validated before deployment
+
+## Troubleshooting
+
+### High Variance in Results
+- Ensure `RUST_TEST_THREADS=1` for consistent execution
+- Check for external factors affecting test environment
+- Verify test data setup is deterministic
+
+### Unexpected Regressions
+- Review recent code changes for performance impacts
+- Check if test scenarios still match actual usage patterns
+- Validate that baseline measurements are still accurate
+
+### Adding Contract-Specific Thresholds
+Some operations may have inherently higher variance:
+- Iteration-heavy operations (higher CPU threshold)
+- Dynamic memory allocation (higher memory threshold)
+- Complex calculations (higher CPU threshold)
+
+Update `thresholds.json` with appropriate values based on operation characteristics.
