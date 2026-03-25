@@ -35,7 +35,7 @@ Lower numeric value is higher privilege.
 
 | Operation | Methods | Allowed caller | Key guards |
 |---|---|---|---|
-| Initialize wallet | `init` | Owner address passed to `init` | One-time only (`"Wallet already initialized"` panic) |
+| Initialize wallet | `init` | Owner address passed to `init` must `require_auth` | One-time only: second call returns `Error::AlreadyInitialized`. `initial_members` validated **before** any storage write; must not contain `owner` or duplicate addresses (`Error::OwnerInInitialMembers`, `Error::DuplicateInitialMember`). Returns `Result<bool, Error>` (`Ok(true)` on success). |
 | Add member (strict) | `add_member` | Owner or Admin | Role cannot be `Owner`; rejects duplicates; spending limit must be `>= 0`; returns `Result` |
 | Add member (legacy overwrite path) | `add_family_member` | Owner or Admin | Role cannot be `Owner`; overwrites existing member record; limit forced to `0` |
 | Remove member | `remove_family_member` | Owner only | Cannot remove owner |
@@ -61,6 +61,50 @@ Lower numeric value is higher privilege.
 | `MAX_ACCESS_AUDIT_ENTRIES` | `100` | Access audit ring size (last 100 retained) |
 | `INSTANCE_BUMP_AMOUNT` | `518400` ledgers | Active-instance TTL extension target |
 | `ARCHIVE_BUMP_AMOUNT` | `2592000` ledgers | Archive TTL extension target |
+
+### Initialization invariants and security assumptions
+
+- **Authentication**: The `owner` argument must authorize the transaction; otherwise `init` does not proceed.
+- **One-shot**: If `OWNER` is already stored, `init` returns `AlreadyInitialized` and does not change state.
+- **Member list**:
+  - Every address in `initial_members` must differ from `owner`. Including `owner` would previously overwrite the stored role with `Member`; that is now rejected as `OwnerInInitialMembers`.
+  - `initial_members` must not contain the same address twice; duplicates are rejected as `DuplicateInitialMember` instead of silently collapsing to one map entry.
+- **Role defaults on success**:
+  - `owner` is stored exactly once as `FamilyRole::Owner` with `spending_limit: 0`.
+  - Each `initial_members` entry is stored as `FamilyRole::Member` with `spending_limit: 0`.
+- **Atomicity**: Input validation runs before `extend_instance_ttl` and before any `instance` storage mutation, so invalid input does not leave a partially initialized wallet.
+
+#### `init` control flow
+
+```mermaid
+flowchart TD
+  A[init called] --> B{OWNER set?}
+  B -->|yes| C[Err AlreadyInitialized]
+  B -->|no| D[require_auth owner]
+  D --> E[scan initial_members]
+  E --> F{addr equals owner?}
+  F -->|yes| G[Err OwnerInInitialMembers]
+  F -->|no| H{seen addr?}
+  H -->|yes| I[Err DuplicateInitialMember]
+  H -->|no| J[mark seen]
+  J --> K{more items?}
+  K -->|yes| E
+  K -->|no| L[persist OWNER MEMBERS defaults]
+  L --> M[Ok true]
+```
+
+### Contract errors relevant to `init`
+
+| Code | Variant | When |
+|------|---------|------|
+| 14 | `AlreadyInitialized` | `init` called after successful initialization |
+| 15 | `DuplicateInitialMember` | Two or more equal addresses in `initial_members` |
+| 16 | `OwnerInInitialMembers` | `owner` appears in `initial_members` |
+
+### Test coverage
+
+- Run `cargo test -p family_wallet` for the full suite (including init edge cases).
+- For line coverage targets (for example 95%), use `cargo llvm-cov -p family_wallet` if [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) is installed locally; the workspace does not pin a coverage tool in `Cargo.toml`.
 
 ### Default Configs Set During `init`
 

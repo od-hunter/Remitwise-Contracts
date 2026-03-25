@@ -15,7 +15,9 @@ pub fn set_ledger_time(env: &Env, sequence_number: u32, timestamp: u64) {
         base_reserve: 10,
         min_temp_entry_ttl: 1,
         min_persistent_entry_ttl: 1,
-        max_entry_ttl: 100000,
+        // Ensure TTL-related tests can observe contract TTL extension logic.
+        // For example, family_wallet expects INSTANCE_BUMP_AMOUNT=518_400 ledgers.
+        max_entry_ttl: 2_000_000,
     });
 }
 

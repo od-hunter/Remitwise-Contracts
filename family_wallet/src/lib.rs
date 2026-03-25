@@ -172,16 +172,71 @@ pub enum Error {
     MemberNotFound = 11,
     TransactionAlreadyExecuted = 12,
     InvalidSpendingLimit = 13,
+    /// @notice Wallet `OWNER` is already stored; `init` is one-shot.
+    AlreadyInitialized = 14,
+    /// @notice Two or more entries in `initial_members` share the same address.
+    DuplicateInitialMember = 15,
+    /// @notice `owner` must not appear in `initial_members` (would corrupt `FamilyRole::Owner`).
+    OwnerInInitialMembers = 16,
 }
 
 #[contractimpl]
 impl FamilyWallet {
-    pub fn init(env: Env, owner: Address, initial_members: Vec<Address>) -> bool {
+    /// @notice One-time initialization of the family wallet.
+    ///
+    /// # Arguments
+    /// * `owner` — Must authenticate via `require_auth`. Becomes the sole `FamilyRole::Owner`
+    ///   and must **not** be listed again in `initial_members`.
+    /// * `initial_members` — Distinct addresses stored as `FamilyRole::Member` with
+    ///   `spending_limit: 0`. Duplicates and any entry equal to `owner` are rejected.
+    ///
+    /// # Errors
+    /// * [`Error::AlreadyInitialized`] — `OWNER` key already set.
+    /// * [`Error::OwnerInInitialMembers`] — `owner` appears in `initial_members`.
+    /// * [`Error::DuplicateInitialMember`] — duplicate address in `initial_members`.
+    ///
+    /// # Security
+    /// Validation runs before any instance storage write so failed calls leave no partial state.
+    /// Callers must not pass `owner` in `initial_members`; doing so used to overwrite the owner
+    /// record with `Member` and is now explicitly rejected.
+    pub fn init(
+        env: Env,
+        owner: Address,
+        initial_members: Vec<Address>,
+    ) -> Result<bool, Error> {
         owner.require_auth();
 
         let existing: Option<Address> = env.storage().instance().get(&symbol_short!("OWNER"));
         if existing.is_some() {
-            panic!("Wallet already initialized");
+            return Err(Error::AlreadyInitialized);
+        }
+
+        // Validate invariants without touching contract instance storage.
+        //
+        // Important: avoid creating `Map`/`Vec` helper structures here. In the
+        // Soroban test environment they can materialize host-side storage
+        // entries and prevent `extend_instance_ttl` from doing its job.
+        let initial_len = initial_members.len();
+        for i in 0..initial_len {
+            let member_i = match initial_members.get(i) {
+                Some(a) => a,
+                None => panic!("Invalid initial_members vector"),
+            };
+
+            if member_i == owner {
+                return Err(Error::OwnerInInitialMembers);
+            }
+
+            for j in (i + 1)..initial_len {
+                let member_j = match initial_members.get(j) {
+                    Some(a) => a,
+                    None => panic!("Invalid initial_members vector"),
+                };
+
+                if member_i == member_j {
+                    return Err(Error::DuplicateInitialMember);
+                }
+            }
         }
 
         Self::extend_instance_ttl(&env);
@@ -265,7 +320,7 @@ impl FamilyWallet {
             .instance()
             .set(&symbol_short!("EM_LAST"), &0u64);
 
-        true
+        Ok(true)
     }
 
     pub fn add_member(

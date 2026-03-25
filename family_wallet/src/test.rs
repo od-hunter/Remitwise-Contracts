@@ -5,18 +5,24 @@ use soroban_sdk::{
     token::{StellarAssetClient, TokenClient},
     vec, Env,
 };
-use testutils::{set_ledger_time, setup_test_env};
+use testutils::set_ledger_time;
 
 #[test]
 fn test_initialize_wallet_succeeds() {
-    setup_test_env!(env, FamilyWallet, client, owner);
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
 
     let member1 = Address::generate(&env);
     let member2 = Address::generate(&env);
     let initial_members = vec![&env, member1.clone(), member2.clone()];
 
-    let result = client.init(&owner, &initial_members);
-    assert!(result);
+    assert!(
+        client.init(&owner, &initial_members),
+        "init must succeed with distinct non-owner members"
+    );
 
     let stored_owner = client.get_owner();
     assert_eq!(stored_owner, owner);
@@ -32,6 +38,95 @@ fn test_initialize_wallet_succeeds() {
     let owner_data = client.get_family_member(&owner);
     assert!(owner_data.is_some());
     assert_eq!(owner_data.unwrap().role, FamilyRole::Owner);
+}
+
+#[test]
+fn test_init_rejects_owner_in_initial_members() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    let initial_members = vec![&env, member1.clone(), owner.clone()];
+
+    assert_eq!(
+        client.try_init(&owner, &initial_members),
+        Err(Ok(Error::OwnerInInitialMembers))
+    );
+}
+
+#[test]
+fn test_init_rejects_duplicate_initial_members() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    let initial_members = vec![&env, member1.clone(), member1.clone()];
+
+    assert_eq!(
+        client.try_init(&owner, &initial_members),
+        Err(Ok(Error::DuplicateInitialMember))
+    );
+}
+
+#[test]
+fn test_init_rejects_double_initialization() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    let initial_members = vec![&env, member1.clone()];
+
+    assert!(client.init(&owner, &initial_members));
+    assert_eq!(
+        client.try_init(&owner, &initial_members),
+        Err(Ok(Error::AlreadyInitialized))
+    );
+}
+
+#[test]
+fn test_init_succeeds_with_empty_initial_members() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members: soroban_sdk::Vec<Address> = vec![&env];
+
+    assert!(client.init(&owner, &initial_members));
+
+    let owner_data = client.get_family_member(&owner).unwrap();
+    assert_eq!(owner_data.role, FamilyRole::Owner);
+
+    let random_member = Address::generate(&env);
+    assert!(client.get_family_member(&random_member).is_none());
+}
+
+#[test]
+#[should_panic(expected = "Wallet not initialized")]
+fn test_init_failure_does_not_persist_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    let initial_members = vec![&env, member1.clone(), owner.clone()];
+
+    let _ = client.try_init(&owner, &initial_members);
+
+    // Since init reverted, OWNER must never be set.
+    let _ = client.get_owner();
 }
 
 #[test]
@@ -812,8 +907,8 @@ fn test_instance_ttl_extended_on_init() {
     let member1 = Address::generate(&env);
 
     // init calls extend_instance_ttl
-    let result = client.init(&owner, &vec![&env, member1.clone()]);
-    assert!(result);
+    let ok = client.init(&owner, &vec![&env, member1.clone()]);
+    assert!(ok);
 
     // Inspect instance TTL — must be at least INSTANCE_BUMP_AMOUNT (518,400)
     let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());

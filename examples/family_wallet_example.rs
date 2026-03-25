@@ -17,14 +17,17 @@ fn main() {
 
     println!("--- Remitwise: Family Wallet Example ---");
 
-    // 4. [Write] Initialize the wallet with an owner and some initial members
+    // 4. [Write] Initialize the wallet. Do not include `owner` in `initial_members`
+    // (the contract rejects that to preserve FamilyRole::Owner).
     println!("Initializing wallet with owner: {:?}", owner);
-    let mut initial_members = Vec::new(&env);
-    initial_members.push_back(owner.clone());
-    initial_members.push_back(member1.clone());
-    
-    client.init(&owner, &initial_members);
-    println!("Wallet initialized successfully!");
+    let initial_members = soroban_sdk::vec![&env, member1.clone()];
+
+    match client.try_init(&owner, &initial_members) {
+        Ok(Ok(true)) => println!("Wallet initialized successfully!"),
+        Ok(Ok(_)) => eprintln!("init returned unexpected success value"),
+        Ok(Err(e)) => panic!("init failed: {:?}", e),
+        Err(e) => panic!("host error on init: {:?}", e),
+    }
 
     // 5. [Read] Check roles of members
     let owner_member = client.get_member(&owner).unwrap();
