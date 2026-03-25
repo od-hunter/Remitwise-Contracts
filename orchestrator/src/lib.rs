@@ -224,7 +224,7 @@ pub enum OrchestratorError {
 /// At most one execution can be active at any time. Any attempt to enter
 /// `Executing` state while already executing returns `ReentrancyDetected`.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ExecutionState {
     /// No execution in progress; entry points may be called
@@ -475,6 +475,47 @@ impl Orchestrator {
         } else {
             Err(OrchestratorError::SpendingLimitExceeded)
         }
+    }
+
+    /// Validate contract address wiring for full remittance flow execution.
+    ///
+    /// Security checks:
+    /// - No downstream address may equal the orchestrator's own address.
+    /// - All downstream addresses must be distinct to avoid role confusion.
+    fn validate_remittance_flow_addresses(
+        env: &Env,
+        family_wallet_addr: &Address,
+        remittance_split_addr: &Address,
+        savings_addr: &Address,
+        bills_addr: &Address,
+        insurance_addr: &Address,
+    ) -> Result<(), OrchestratorError> {
+        let self_addr = env.current_contract_address();
+
+        if family_wallet_addr == &self_addr
+            || remittance_split_addr == &self_addr
+            || savings_addr == &self_addr
+            || bills_addr == &self_addr
+            || insurance_addr == &self_addr
+        {
+            return Err(OrchestratorError::InvalidContractAddress);
+        }
+
+        if family_wallet_addr == remittance_split_addr
+            || family_wallet_addr == savings_addr
+            || family_wallet_addr == bills_addr
+            || family_wallet_addr == insurance_addr
+            || remittance_split_addr == savings_addr
+            || remittance_split_addr == bills_addr
+            || remittance_split_addr == insurance_addr
+            || savings_addr == bills_addr
+            || savings_addr == insurance_addr
+            || bills_addr == insurance_addr
+        {
+            return Err(OrchestratorError::InvalidContractAddress);
+        }
+
+        Ok(())
     }
 
     // ============================================================================

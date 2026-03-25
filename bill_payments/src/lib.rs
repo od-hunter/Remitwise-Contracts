@@ -2962,7 +2962,7 @@ fn extend_instance_ttl(env: &Env) {
         INSTANCE_BUMP_AMOUNT
     );
 }
-}
+
 
 pub fn create_bill(env: Env, ...) {
     extend_instance_ttl(&env); // Keep contract alive
