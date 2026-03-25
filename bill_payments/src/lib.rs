@@ -176,56 +176,13 @@ impl BillPayments {
     ///
     /// # Returns
     /// Normalized currency string with:
-    /// 1. Whitespace trimmed from both ends
-    /// 2. Converted to uppercase
-    /// 3. Empty strings default to "XLM"
-    ///
-    /// # Examples
-    /// - "usdc" → "USDC"
-    /// - " XLM " → "XLM"
-    /// - "" → "XLM"
-    /// - "UsDc" → "USDC"
+    /// 1. Empty strings default to "XLM"
     fn normalize_currency(env: &Env, currency: &String) -> String {
-        let trimmed = currency.trim();
-        if trimmed.is_empty() {
+        if currency.len() == 0 {
             String::from_str(env, "XLM")
         } else {
-            String::from_str(env, &trimmed.to_uppercase())
+            currency.clone()
         }
-    }
-
-    /// Validate a currency string according to contract requirements.
-    ///
-    /// # Arguments
-    /// * `currency` - Currency code string to validate
-    ///
-    /// # Returns
-    /// * `Ok(())` if the currency is valid
-    /// * `Err(Error::InvalidCurrency)` if invalid
-    ///
-    /// # Validation Rules
-    /// 1. Length must be 1-12 characters (after trimming)
-    /// 2. Must contain only alphanumeric characters (A-Z, a-z, 0-9)
-    /// 3. Empty strings are allowed (will be normalized to "XLM")
-    ///
-    /// # Examples
-    /// - Valid: "XLM", "USDC", "NGN", "EUR123"
-    /// - Invalid: "USD$", "BTC-ETH", "XLM/USD", "ABCDEFGHIJKLM" (too long)
-    fn validate_currency(currency: &String) -> Result<(), Error> {
-        let s = currency.trim();
-        if s.is_empty() {
-            return Ok(()); // Will be normalized to "XLM"
-        }
-        if s.len() > 12 {
-            return Err(Error::InvalidCurrency);
-        }
-        // Check if all characters are alphanumeric (A-Z, a-z, 0-9)
-        for ch in s.chars() {
-            if !ch.is_ascii_alphanumeric() {
-                return Err(Error::InvalidCurrency);
-            }
-        }
-        Ok(())
     }
 
     fn get_pause_admin(env: &Env) -> Option<Address> {
@@ -485,15 +442,11 @@ impl BillPayments {
     /// * `InvalidAmount` - If amount is zero or negative
     /// * `InvalidFrequency` - If recurring is true but frequency_days is 0
     /// * `InvalidDueDate` - If due_date is 0 or in the past
-    /// * `InvalidCurrency` - If currency code is invalid (non-alphanumeric or wrong length)
     /// * `ContractPaused` - If contract is globally paused
     /// * `FunctionPaused` - If create_bill function is paused
     ///
     /// # Currency Normalization
-    /// - Converts to uppercase (e.g., "usdc" → "USDC")
-    /// - Trims whitespace (e.g., " XLM " → "XLM")
     /// - Empty string defaults to "XLM"
-    /// - Validates: 1-12 alphanumeric characters only
     #[allow(clippy::too_many_arguments)]
     pub fn create_bill(
         env: Env,
@@ -521,8 +474,7 @@ impl BillPayments {
             return Err(BillPaymentsError::InvalidFrequency);
         }
 
-        // Validate and normalize currency
-        Self::validate_currency(&currency)?;
+        // Normalize currency (empty defaults to "XLM")
         let resolved_currency = Self::normalize_currency(&env, &currency);
 
         Self::extend_instance_ttl(&env);
@@ -1344,6 +1296,7 @@ impl BillPayments {
         limit: u32,
     ) -> BillPage {
         let limit = clamp_limit(limit);
+        let normalized_currency = Self::normalize_currency(&env, &currency);
         let bills: Map<u32, Bill> = env
             .storage()
             .instance()
@@ -1396,6 +1349,7 @@ impl BillPayments {
         limit: u32,
     ) -> BillPage {
         let limit = clamp_limit(limit);
+        let normalized_currency = Self::normalize_currency(&env, &currency);
         let bills: Map<u32, Bill> = env
             .storage()
             .instance()
@@ -2975,7 +2929,6 @@ mod test {
         client.bulk_cleanup_bills(&admin, &1000000);
     }
 }
-}
 
 fn extend_instance_ttl(env: &Env) {
     // Extend the contract instance itself
@@ -2983,13 +2936,4 @@ fn extend_instance_ttl(env: &Env) {
         INSTANCE_LIFETIME_THRESHOLD, 
         INSTANCE_BUMP_AMOUNT
     );
-}
-}
-
-pub fn create_bill(env: Env, ...) {
-    extend_instance_ttl(&env); // Keep contract alive
-    // ... logic to create bill ...
-    let key = DataKey::Bill(bill_id);
-    env.storage().persistent().set(&key, &bill);
-    extend_ttl(&env, &key); // Keep this specific bill alive
 }
