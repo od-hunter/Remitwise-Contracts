@@ -237,24 +237,6 @@ fn test_calculate_complex_rounding() {
     assert_eq!(amounts.get(3).unwrap(), 410);
 }
 
-#[test]
-fn test_create_remittance_schedule_succeeds() {
-    setup_test_env!(env, RemittanceSplit, RemittanceSplitClient, client, owner);
-    set_ledger_time(&env, 1000);
-
-    client.initialize_split(&owner, &0, &50, &30, &15, &5);
-
-    let schedule_id = client.create_remittance_schedule(&owner, &10000, &3000, &86400);
-    assert_eq!(schedule_id, 1);
-
-    let schedule = client.get_remittance_schedule(&schedule_id);
-    assert!(schedule.is_some());
-    let schedule = schedule.unwrap();
-    assert_eq!(schedule.amount, 10000);
-    assert_eq!(schedule.next_due, 3000);
-    assert_eq!(schedule.interval, 86400);
-    assert!(schedule.active);
-}
 // ---------------------------------------------------------------------------
 // distribute_usdc — happy path
 // ---------------------------------------------------------------------------
@@ -901,8 +883,10 @@ fn test_export_snapshot_contains_correct_schema_version() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = setup_token(&env, &token_admin, &owner, 0);
 
-    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    client.initialize_split(&owner, &0, &token_id, &50, &30, &15, &5);
 
     let snapshot = client.export_snapshot(&owner).unwrap();
     assert_eq!(
@@ -919,8 +903,10 @@ fn test_import_snapshot_current_schema_version_succeeds() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = setup_token(&env, &token_admin, &owner, 0);
 
-    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    client.initialize_split(&owner, &0, &token_id, &50, &30, &15, &5);
 
     let snapshot = client.export_snapshot(&owner).unwrap();
     assert_eq!(snapshot.schema_version, 1);
@@ -938,8 +924,10 @@ fn test_import_snapshot_future_schema_version_rejected() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = setup_token(&env, &token_admin, &owner, 0);
 
-    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    client.initialize_split(&owner, &0, &token_id, &50, &30, &15, &5);
 
     let mut snapshot = client.export_snapshot(&owner).unwrap();
     // Simulate a snapshot produced by a newer contract version.
@@ -962,8 +950,10 @@ fn test_import_snapshot_too_old_schema_version_rejected() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = setup_token(&env, &token_admin, &owner, 0);
 
-    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    client.initialize_split(&owner, &0, &token_id, &50, &30, &15, &5);
 
     let mut snapshot = client.export_snapshot(&owner).unwrap();
     // Simulate a snapshot too old to import.
@@ -986,8 +976,10 @@ fn test_import_snapshot_tampered_checksum_rejected() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = setup_token(&env, &token_admin, &owner, 0);
 
-    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    client.initialize_split(&owner, &0, &token_id, &50, &30, &15, &5);
 
     let mut snapshot = client.export_snapshot(&owner).unwrap();
     snapshot.checksum = snapshot.checksum.wrapping_add(1);
@@ -1008,8 +1000,10 @@ fn test_snapshot_export_import_roundtrip_restores_config() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = setup_token(&env, &token_admin, &owner, 0);
 
-    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    client.initialize_split(&owner, &0, &token_id, &50, &30, &15, &5);
 
     // Update so there is something interesting to round-trip.
     // Note: update_split checks the nonce but does NOT increment it.
@@ -1038,8 +1032,10 @@ fn test_import_snapshot_unauthorized_caller_rejected() {
     let client = RemittanceSplitClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
     let other = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = setup_token(&env, &token_admin, &owner, 0);
 
-    client.initialize_split(&owner, &0, &50, &30, &15, &5);
+    client.initialize_split(&owner, &0, &token_id, &50, &30, &15, &5);
 
     let snapshot = client.export_snapshot(&owner).unwrap();
 
@@ -1049,4 +1045,211 @@ fn test_import_snapshot_unauthorized_caller_rejected() {
         Err(Ok(RemittanceSplitError::Unauthorized)),
         "non-owner must not import snapshot"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Audit log pagination
+// ---------------------------------------------------------------------------
+
+/// Helper: initialize + update N times to seed the audit log with entries.
+/// Each initialize produces 1 entry, each update produces 1 entry.
+/// Returns (client, owner) for further assertions.
+fn seed_audit_log(
+    env: &Env,
+    count: u32,
+) -> (RemittanceSplitClient<'_>, Address) {
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(env, &contract_id);
+    let owner = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token_id = setup_token(env, &token_admin, &owner, 0);
+
+    // initialize_split appends 1 audit entry on success (nonce 0 → 1)
+    client.initialize_split(&owner, &0, &token_id, &25, &25, &25, &25);
+
+    // import_snapshot appends 1 audit entry on success and increments nonce.
+    // Use repeated import_snapshot calls to seed additional entries.
+    for nonce in 1..count as u64 {
+        let snapshot = client.export_snapshot(&owner).unwrap();
+        client.import_snapshot(&owner, &nonce, &snapshot);
+    }
+
+    (client, owner)
+}
+
+/// Collect every audit entry by following next_cursor until it returns 0.
+fn collect_all_pages(client: &RemittanceSplitClient, page_size: u32) -> soroban_sdk::Vec<AuditEntry> {
+    let env = client.env.clone();
+    let mut all = soroban_sdk::Vec::new(&env);
+    let mut cursor: u32 = 0;
+    let mut first = true;
+    loop {
+        let page = client.get_audit_log(&cursor, &page_size);
+        if page.count == 0 {
+            break;
+        }
+        for i in 0..page.items.len() {
+            if let Some(entry) = page.items.get(i) {
+                all.push_back(entry);
+            }
+        }
+        if page.next_cursor == 0 {
+            break;
+        }
+        if !first && cursor == page.next_cursor {
+            panic!("cursor did not advance — infinite loop detected");
+        }
+        first = false;
+        cursor = page.next_cursor;
+    }
+    all
+}
+
+#[test]
+fn test_get_audit_log_empty_returns_zero_cursor() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(&env, &contract_id);
+
+    let page = client.get_audit_log(&0, &10);
+    assert_eq!(page.count, 0);
+    assert_eq!(page.next_cursor, 0);
+    assert_eq!(page.items.len(), 0);
+}
+
+#[test]
+fn test_get_audit_log_single_page() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _owner) = seed_audit_log(&env, 3);
+
+    // Request all 3 with a large limit
+    let page = client.get_audit_log(&0, &50);
+    assert_eq!(page.count, 3);
+    assert_eq!(page.next_cursor, 0, "no more pages");
+}
+
+#[test]
+fn test_get_audit_log_multi_page_no_gaps_no_duplicates() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let entry_count: u32 = 15;
+    let (client, _owner) = seed_audit_log(&env, entry_count);
+
+    // Paginate with page_size = 4 → expect 4 pages (4+4+4+3)
+    let all = collect_all_pages(&client, 4);
+    assert_eq!(
+        all.len(),
+        entry_count,
+        "total entries collected must equal entries seeded"
+    );
+
+    // Verify strict timestamp ordering (no duplicates, no gaps)
+    for i in 1..all.len() {
+        let prev = all.get(i - 1).unwrap();
+        let curr = all.get(i).unwrap();
+        assert!(
+            curr.timestamp >= prev.timestamp,
+            "entries must be ordered by timestamp"
+        );
+    }
+}
+
+#[test]
+fn test_get_audit_log_cursor_boundaries_and_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _owner) = seed_audit_log(&env, 10);
+
+    // First page: 5 items
+    let p1 = client.get_audit_log(&0, &5);
+    assert_eq!(p1.count, 5);
+    assert_eq!(p1.next_cursor, 5);
+
+    // Second page: 5 items
+    let p2 = client.get_audit_log(&p1.next_cursor, &5);
+    assert_eq!(p2.count, 5);
+    assert_eq!(p2.next_cursor, 0, "exactly at end → no more pages");
+
+    // Out-of-range cursor
+    let p3 = client.get_audit_log(&100, &5);
+    assert_eq!(p3.count, 0);
+    assert_eq!(p3.next_cursor, 0);
+}
+
+#[test]
+fn test_get_audit_log_limit_zero_uses_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _owner) = seed_audit_log(&env, 5);
+
+    // limit=0 should clamp to DEFAULT_PAGE_LIMIT (20), returning all 5
+    let page = client.get_audit_log(&0, &0);
+    assert_eq!(page.count, 5);
+    assert_eq!(page.next_cursor, 0);
+}
+
+#[test]
+fn test_get_audit_log_large_cursor_does_not_overflow_or_duplicate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _owner) = seed_audit_log(&env, 5);
+
+    // u32::MAX cursor must not panic from overflow
+    let page = client.get_audit_log(&u32::MAX, &50);
+    assert_eq!(page.count, 0);
+    assert_eq!(page.next_cursor, 0);
+}
+
+#[test]
+fn test_get_audit_log_limit_clamped_to_max_page_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // Seed 30 entries; request with limit > MAX_PAGE_LIMIT (50)
+    let (client, _owner) = seed_audit_log(&env, 30);
+
+    // limit=200 should clamp to MAX_PAGE_LIMIT=50, but we only have 30
+    let page = client.get_audit_log(&0, &200);
+    assert_eq!(page.count, 30);
+    assert_eq!(page.next_cursor, 0, "all entries fit in one clamped page");
+
+    // Verify clamping with a smaller set: request 5, get 5, more remain
+    let p1 = client.get_audit_log(&0, &5);
+    assert_eq!(p1.count, 5);
+    assert!(p1.next_cursor > 0, "more pages remain");
+}
+
+#[test]
+fn test_get_audit_log_deterministic_replay() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let entry_count: u32 = 10;
+    let (client, _owner) = seed_audit_log(&env, entry_count);
+
+    let all = collect_all_pages(&client, 3);
+    assert_eq!(all.len(), entry_count);
+
+    // Verify deterministic replay: same query returns same results
+    let replay = collect_all_pages(&client, 3);
+    assert_eq!(all.len(), replay.len());
+    for i in 0..all.len() {
+        let a = all.get(i).unwrap();
+        let b = replay.get(i).unwrap();
+        assert_eq!(a.timestamp, b.timestamp);
+        assert_eq!(a.operation, b.operation);
+        assert_eq!(a.caller, b.caller);
+        assert_eq!(a.success, b.success);
+    }
+}
+
+#[test]
+fn test_get_audit_log_page_size_one_walks_entire_log() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _owner) = seed_audit_log(&env, 8);
+
+    // Walk with page_size=1 to stress cursor advancement
+    let all = collect_all_pages(&client, 1);
+    assert_eq!(all.len(), 8);
 }

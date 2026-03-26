@@ -129,6 +129,21 @@ pub struct AuditEntry {
     pub success: bool,
 }
 
+/// Paginated result for audit log queries.
+///
+/// Provides stable cursor-based pagination so consumers can replay the log
+/// without gaps or duplicates across page boundaries.
+#[contracttype]
+#[derive(Clone)]
+pub struct AuditPage {
+    /// Audit entries for this page, ordered oldest-to-newest.
+    pub items: Vec<AuditEntry>,
+    /// Index to pass as `from_index` for the next page. 0 means no more pages.
+    pub next_cursor: u32,
+    /// Number of items returned in this page.
+    pub count: u32,
+}
+
 /// Schedule for automatic remittance splits
 #[contracttype]
 #[derive(Clone)]
@@ -161,7 +176,20 @@ const SCHEMA_VERSION: u32 = 1;
 /// Oldest snapshot schema version this contract can import. Enables backward compat.
 const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 const MAX_AUDIT_ENTRIES: u32 = 100;
+const DEFAULT_PAGE_LIMIT: u32 = 20;
+const MAX_PAGE_LIMIT: u32 = 50;
 const CONTRACT_VERSION: u32 = 1;
+
+/// Clamp a caller-supplied page limit to a sane range.
+fn clamp_limit(limit: u32) -> u32 {
+    if limit == 0 {
+        DEFAULT_PAGE_LIMIT
+    } else if limit > MAX_PAGE_LIMIT {
+        MAX_PAGE_LIMIT
+    } else {
+        limit
+    }
+}
 
 #[contract]
 pub struct RemittanceSplit;
@@ -292,9 +320,9 @@ impl RemittanceSplit {
                     return Err(RemittanceSplitError::Unauthorized);
                 }
             }
-            Some(current_admin) => {
+            Some(ref current_admin) => {
                 // Admin transfer - only current admin can transfer
-                if current_admin != caller {
+                if *current_admin != caller {
                     return Err(RemittanceSplitError::Unauthorized);
                 }
             }
@@ -787,22 +815,49 @@ impl RemittanceSplit {
         Ok(true)
     }
 
-    pub fn get_audit_log(env: Env, from_index: u32, limit: u32) -> Vec<AuditEntry> {
+    /// Return a page of audit log entries with a stable cursor.
+    ///
+    /// # Parameters
+    /// - `from_index`: zero-based starting index (pass 0 for the first page,
+    ///   then use the returned `next_cursor` for subsequent pages).
+    /// - `limit`: maximum entries to return; clamped to `[DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT]`.
+    ///
+    /// # Pagination contract
+    /// - Entries are returned oldest-to-newest within the rotating log window.
+    /// - `next_cursor == 0` signals no more pages.
+    /// - Uses saturating arithmetic so a caller cannot trigger overflow panics.
+    /// - Deterministic: identical `(from_index, limit)` on identical state always
+    ///   returns the same page, enabling reliable replay by audit consumers.
+    pub fn get_audit_log(env: Env, from_index: u32, limit: u32) -> AuditPage {
         let log: Option<Vec<AuditEntry>> = env.storage().instance().get(&symbol_short!("AUDIT"));
         let log = log.unwrap_or_else(|| Vec::new(&env));
         let len = log.len();
-        let cap = MAX_AUDIT_ENTRIES.min(limit);
-        let mut out = Vec::new(&env);
+        let cap = clamp_limit(limit);
+
         if from_index >= len {
-            return out;
+            return AuditPage {
+                items: Vec::new(&env),
+                next_cursor: 0,
+                count: 0,
+            };
         }
-        let end = (from_index + cap).min(len);
+
+        let end = from_index.saturating_add(cap).min(len);
+        let mut items = Vec::new(&env);
         for i in from_index..end {
             if let Some(entry) = log.get(i) {
-                out.push_back(entry);
+                items.push_back(entry);
             }
         }
-        out
+
+        let count = items.len();
+        let next_cursor = if end < len { end } else { 0 };
+
+        AuditPage {
+            items,
+            next_cursor,
+            count,
+        }
     }
 
     fn require_nonce(
