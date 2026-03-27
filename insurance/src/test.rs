@@ -331,3 +331,311 @@ fn test_remove_tag_emits_event() {
     client.remove_tag(&owner, &id, &String::from_str(&env, "vip"));
     assert!(env.events().all().len() > before);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// QA: Exhaustive tagging tests — unauthorized access, double-tag, ghost remove,
+//     and full event verification.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── 1. Unauthorized Access ────────────────────────────────────────────────────
+
+/// A random address that is neither the policy owner nor the admin must cause
+/// add_tag to panic with "unauthorized". State must be unchanged.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_qa_unauthorized_stranger_cannot_add_tag() {
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    let random = Address::generate(&env);
+    // random is not owner, no admin set — must panic
+    client.add_tag(&random, &id, &String::from_str(&env, "ACTIVE"));
+}
+
+/// A random address must also be blocked from remove_tag.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_qa_unauthorized_stranger_cannot_remove_tag() {
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    client.add_tag(&owner, &id, &String::from_str(&env, "ACTIVE"));
+    let random = Address::generate(&env);
+    client.remove_tag(&random, &id, &String::from_str(&env, "ACTIVE"));
+}
+
+/// After a failed unauthorized add_tag, the policy tags must remain empty —
+/// no partial state mutation.
+#[test]
+fn test_qa_unauthorized_add_leaves_state_unchanged() {
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    let random = Address::generate(&env);
+
+    // attempt unauthorized add — ignore the panic via try_
+    let _ = client.try_add_tag(&random, &id, &String::from_str(&env, "ACTIVE"));
+
+    // state must be untouched
+    assert_eq!(
+        client.get_policy(&id).unwrap().tags.len(),
+        0,
+        "unauthorized call must not mutate policy tags"
+    );
+}
+
+// ── 2. The Double-Tag ─────────────────────────────────────────────────────────
+
+/// Adding "ACTIVE" twice must leave exactly one "ACTIVE" tag in storage.
+#[test]
+fn test_qa_double_tag_active_stored_once() {
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    let active = String::from_str(&env, "ACTIVE");
+
+    client.add_tag(&owner, &id, &active);
+    client.add_tag(&owner, &id, &active); // duplicate
+
+    let tags = client.get_policy(&id).unwrap().tags;
+    assert_eq!(tags.len(), 1, "duplicate tag must not be stored twice");
+    assert_eq!(
+        tags.get(0).unwrap(),
+        String::from_str(&env, "ACTIVE"),
+        "the stored tag must be ACTIVE"
+    );
+}
+
+/// The second (duplicate) add_tag call must emit NO new event — the contract
+/// returns early before publishing.
+#[test]
+fn test_qa_double_tag_second_call_emits_no_event() {
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    let active = String::from_str(&env, "ACTIVE");
+
+    // first add — emits tag_added
+    client.add_tag(&owner, &id, &active);
+    let event_count_after_first = env.events().all().len();
+
+    // second add (duplicate) — must be silent
+    client.add_tag(&owner, &id, &active);
+    assert_eq!(
+        env.events().all().len(),
+        event_count_after_first,
+        "duplicate add_tag must not emit any event"
+    );
+}
+
+/// Adding "ACTIVE" then a different tag then "ACTIVE" again must still result
+/// in exactly two unique tags.
+#[test]
+fn test_qa_double_tag_interleaved_stays_deduplicated() {
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+
+    client.add_tag(&owner, &id, &String::from_str(&env, "ACTIVE"));
+    client.add_tag(&owner, &id, &String::from_str(&env, "VIP"));
+    client.add_tag(&owner, &id, &String::from_str(&env, "ACTIVE")); // dup
+
+    let tags = client.get_policy(&id).unwrap().tags;
+    assert_eq!(tags.len(), 2, "only two unique tags should be stored");
+}
+
+// ── 3. The Ghost Remove ───────────────────────────────────────────────────────
+
+/// Removing a tag that was never added must not crash.
+#[test]
+fn test_qa_ghost_remove_does_not_panic() {
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    // no tags — removing "GHOST" must be graceful
+    client.remove_tag(&owner, &id, &String::from_str(&env, "GHOST"));
+}
+
+/// After a ghost remove the tag list must still be empty.
+#[test]
+fn test_qa_ghost_remove_state_unchanged() {
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    client.remove_tag(&owner, &id, &String::from_str(&env, "GHOST"));
+    assert_eq!(
+        client.get_policy(&id).unwrap().tags.len(),
+        0,
+        "ghost remove must not alter the tag list"
+    );
+}
+
+/// Ghost remove on a policy that already has other tags must not disturb them.
+#[test]
+fn test_qa_ghost_remove_preserves_existing_tags() {
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    client.add_tag(&owner, &id, &String::from_str(&env, "KEEP"));
+    client.remove_tag(&owner, &id, &String::from_str(&env, "GHOST")); // not present
+    let tags = client.get_policy(&id).unwrap().tags;
+    assert_eq!(tags.len(), 1, "existing tags must be preserved after ghost remove");
+    assert_eq!(tags.get(0).unwrap(), String::from_str(&env, "KEEP"));
+}
+
+// ── 4. Event Verification ─────────────────────────────────────────────────────
+
+/// add_tag must publish exactly one event with topic ("insure", "tag_added")
+/// and data (policy_id, tag).
+#[test]
+fn test_qa_add_tag_event_topics_and_data() {
+    use soroban_sdk::{symbol_short, IntoVal};
+
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    let tag = String::from_str(&env, "ACTIVE");
+
+    let events_before = env.events().all().len();
+    client.add_tag(&owner, &id, &tag);
+
+    let all = env.events().all();
+    assert_eq!(
+        all.len(),
+        events_before + 1,
+        "add_tag must emit exactly one event"
+    );
+
+    let (contract_id, topics, data) = all.last().unwrap();
+    let _ = contract_id; // emitted by our contract
+
+    // Verify topics: ("insure", "tag_added")
+    let expected_topics = soroban_sdk::vec![
+        &env,
+        symbol_short!("insure").into_val(&env),
+        symbol_short!("tag_added").into_val(&env),
+    ];
+    assert_eq!(topics, expected_topics, "tag_added event topics mismatch");
+
+    // Verify data: (policy_id, tag)
+    let (emitted_id, emitted_tag): (u32, String) =
+        soroban_sdk::FromVal::from_val(&env, &data);
+    assert_eq!(emitted_id, id, "tag_added event must carry the correct policy_id");
+    assert_eq!(emitted_tag, tag, "tag_added event must carry the correct tag");
+}
+
+/// remove_tag on an existing tag must publish exactly one event with topic
+/// ("insure", "tag_rmvd") and data (policy_id, tag).
+#[test]
+fn test_qa_remove_tag_event_topics_and_data() {
+    use soroban_sdk::{symbol_short, IntoVal};
+
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    let tag = String::from_str(&env, "ACTIVE");
+    client.add_tag(&owner, &id, &tag);
+
+    let events_before = env.events().all().len();
+    client.remove_tag(&owner, &id, &tag);
+
+    let all = env.events().all();
+    assert_eq!(
+        all.len(),
+        events_before + 1,
+        "remove_tag must emit exactly one event"
+    );
+
+    let (_, topics, data) = all.last().unwrap();
+
+    let expected_topics = soroban_sdk::vec![
+        &env,
+        symbol_short!("insure").into_val(&env),
+        symbol_short!("tag_rmvd").into_val(&env),
+    ];
+    assert_eq!(topics, expected_topics, "tag_rmvd event topics mismatch");
+
+    let (emitted_id, emitted_tag): (u32, String) =
+        soroban_sdk::FromVal::from_val(&env, &data);
+    assert_eq!(emitted_id, id);
+    assert_eq!(emitted_tag, tag);
+}
+
+/// Ghost remove must publish exactly one event with topic ("insure", "tag_miss")
+/// and data (policy_id, tag) — the "Tag Not Found" signal.
+#[test]
+fn test_qa_ghost_remove_event_topics_and_data() {
+    use soroban_sdk::{symbol_short, IntoVal};
+
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    let tag = String::from_str(&env, "GHOST");
+
+    let events_before = env.events().all().len();
+    client.remove_tag(&owner, &id, &tag);
+
+    let all = env.events().all();
+    assert_eq!(
+        all.len(),
+        events_before + 1,
+        "ghost remove must emit exactly one tag_miss event"
+    );
+
+    let (_, topics, data) = all.last().unwrap();
+
+    let expected_topics = soroban_sdk::vec![
+        &env,
+        symbol_short!("insure").into_val(&env),
+        symbol_short!("tag_miss").into_val(&env),
+    ];
+    assert_eq!(topics, expected_topics, "tag_miss event topics mismatch");
+
+    let (emitted_id, emitted_tag): (u32, String) =
+        soroban_sdk::FromVal::from_val(&env, &data);
+    assert_eq!(emitted_id, id, "tag_miss event must carry the correct policy_id");
+    assert_eq!(emitted_tag, tag, "tag_miss event must carry the correct tag");
+}
+
+/// Full lifecycle: add "ACTIVE", add "ACTIVE" again (dup), remove "ACTIVE",
+/// remove "ACTIVE" again (ghost). Verify the exact event sequence.
+#[test]
+fn test_qa_full_lifecycle_event_sequence() {
+    use soroban_sdk::{symbol_short, IntoVal};
+
+    let (env, client, owner) = setup();
+    let id = make_policy(&env, &client, &owner);
+    let tag = String::from_str(&env, "ACTIVE");
+
+    let baseline = env.events().all().len(); // events from create_policy
+
+    // 1. add "ACTIVE" → emits tag_added
+    client.add_tag(&owner, &id, &tag);
+    assert_eq!(env.events().all().len(), baseline + 1);
+
+    // 2. add "ACTIVE" again (dup) → no event
+    client.add_tag(&owner, &id, &tag);
+    assert_eq!(env.events().all().len(), baseline + 1, "dup add must be silent");
+
+    // 3. remove "ACTIVE" → emits tag_rmvd
+    client.remove_tag(&owner, &id, &tag);
+    assert_eq!(env.events().all().len(), baseline + 2);
+
+    // 4. remove "ACTIVE" again (ghost) → emits tag_miss
+    client.remove_tag(&owner, &id, &tag);
+    assert_eq!(env.events().all().len(), baseline + 3);
+
+    // Verify the three event topics in order
+    let all = env.events().all();
+    let e1 = all.get(baseline as u32).unwrap();
+    let e2 = all.get((baseline + 1) as u32).unwrap();
+    let e3 = all.get((baseline + 2) as u32).unwrap();
+
+    let topic_added = soroban_sdk::vec![
+        &env,
+        symbol_short!("insure").into_val(&env),
+        symbol_short!("tag_added").into_val(&env),
+    ];
+    let topic_rmvd = soroban_sdk::vec![
+        &env,
+        symbol_short!("insure").into_val(&env),
+        symbol_short!("tag_rmvd").into_val(&env),
+    ];
+    let topic_miss = soroban_sdk::vec![
+        &env,
+        symbol_short!("insure").into_val(&env),
+        symbol_short!("tag_miss").into_val(&env),
+    ];
+
+    assert_eq!(e1.1, topic_added, "first event must be tag_added");
+    assert_eq!(e2.1, topic_rmvd,  "second event must be tag_rmvd");
+    assert_eq!(e3.1, topic_miss,  "third event must be tag_miss");
+}
