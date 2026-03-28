@@ -89,14 +89,22 @@ to prevent silent numeric wrap-around.
 
 ### Authorization
 
-| Function            | Who can call?       |
-|---------------------|---------------------|
-| `init`              | Owner (once)        |
-| `create_policy`     | Any authenticated caller |
-| `pay_premium`       | Any authenticated caller |
-| `set_external_ref`  | Owner only          |
-| `deactivate_policy` | Owner only          |
-| `get_*` (queries)   | Anyone (read-only)  |
+| Function                        | Who can call?                 |
+|---------------------------------|-------------------------------|
+| `init`                          | Owner (once)                  |
+| `create_policy`                 | Any authenticated caller      |
+| `pay_premium`                   | Any authenticated caller      |
+| `set_external_ref`              | Owner only                    |
+| `deactivate_policy`             | Owner only                    |
+| `set_pause_all`                 | Owner only                    |
+| `set_pause_fn`                  | Owner only                    |
+| `batch_pay_premiums`            | Any authenticated caller      |
+| `create_premium_schedule`       | Any authenticated caller      |
+| `modify_premium_schedule`       | Schedule owner only           |
+| `cancel_premium_schedule`       | Schedule owner only           |
+| `execute_due_premium_schedules` | Anyone (permissionless crank)  |
+| `is_paused` / `is_fn_paused`   | Anyone (read-only)            |
+| `get_*` (queries)               | Anyone (read-only)            |
 
 ### Invariants
 
@@ -157,7 +165,26 @@ Returns the new policy's `u32` ID.
 
 Records a premium payment. `amount` must equal the policy's `monthly_premium` exactly.
 
-Updates `last_payment_at` and advances `next_payment_due` by 30 days.
+Updates `last_payment_at` and advances `next_payment_due` deterministically.
+
+#### Date Progression Logic
+
+The next payment date is calculated to prevent schedule drift:
+
+- **Early/On-time payment**: The next due date advances by exactly one 30-day interval
+  from the *previous* due date (not the current timestamp).
+- **Late payment**: The next due date advances from the previous due date by 30 days.
+  If that new date is still in the past, it continues advancing by 30-day intervals
+  until the next due date is in the future.
+
+This ensures that:
+1. Early payments don't shift the schedule forward (no "drift bonus")
+2. Late payments don't double-cover periods (no skipped periods)
+3. The payment schedule remains deterministic regardless of payment timing
+
+**Example**: If `next_payment_due` is January 15th and payment is made on January 10th,
+the new `next_payment_due` will be February 14th (January 15th + 30 days), not
+February 9th (January 10th + 30 days).
 
 **Emits**: `PremiumPaidEvent`
 
@@ -167,6 +194,22 @@ Updates `last_payment_at` and advances `next_payment_due` by 30 days.
 
 Owner-only. Updates or clears the `external_ref` field of a policy.
 
+**Parameters**
+
+| Parameter    | Type              | Description                              |
+|--------------|-------------------|------------------------------------------|
+| `owner`      | `Address`         | Contract owner (must authorize)          |
+| `policy_id`  | `u32`             | Target policy ID                         |
+| `ext_ref`    | `Option<String>`  | New external reference (1–128 bytes or None) |
+
+**Validates**
+
+- Caller is the contract owner
+- Policy exists
+- External ref length is in range (1–128 bytes if Some, or None to clear)
+
+**Emits**: `ExternalRefUpdatedEvent`
+
 ---
 
 ### `deactivate_policy(owner, policy_id) → bool`
@@ -174,6 +217,49 @@ Owner-only. Updates or clears the `external_ref` field of a policy.
 Owner-only. Marks a policy as inactive and removes it from the active-policy list.
 
 **Emits**: `PolicyDeactivatedEvent`
+
+---
+
+### `set_pause_all(owner, paused: bool)`
+
+Owner-only. Sets or clears the **global emergency pause** flag.  
+When `paused = true`, ALL state-mutating functions (`create_policy`, `pay_premium`,
+`deactivate_policy`, `set_external_ref`, schedule operations, `batch_pay_premiums`)
+will panic with `"contract is paused"`.
+
+The owner can always call this function regardless of the current pause state.
+
+---
+
+### `set_pause_fn(owner, fn_name: Symbol, paused: bool)`
+
+Owner-only. Sets or clears a **granular per-function pause** flag.
+
+Supported `fn_name` values:
+
+| `fn_name`      | Functions blocked                                         |
+|----------------|-----------------------------------------------------------|
+| `"create"`     | `create_policy`                                           |
+| `"pay"`        | `pay_premium`, `batch_pay_premiums`                       |
+| `"deactivate"` | `deactivate_policy`                                       |
+| `"set_ref"`    | `set_external_ref`                                        |
+| `"schedule"`   | `create_premium_schedule`, `modify_premium_schedule`, `cancel_premium_schedule` |
+
+The **global pause always takes priority** over per-function flags.  
+If the global flag is set, all functions are blocked regardless of per-function settings.
+
+---
+
+### `is_paused() → bool`
+
+Returns whether the global emergency pause flag is set.
+
+---
+
+### `is_fn_paused(fn_name: Symbol) → bool`
+
+Returns `true` if the specified function is blocked — either because the
+global pause is set **or** the per-function flag for `fn_name` is `true`.
 
 ---
 
@@ -278,6 +364,24 @@ Published on successful `deactivate_policy`.
 
 Topic: `("deactive", "policy")`
 
+### `ExternalRefUpdatedEvent`
+
+Published on successful `set_external_ref`.
+
+| Field              | Type               |
+|--------------------|--------------------|
+| `policy_id`        | `u32`              |
+| `name`             | `String`           |
+| `new_external_ref` | `Option<String>`   |
+| `old_external_ref` | `Option<String>`   |
+| `timestamp`        | `u64`              |
+
+**Description**: Tracks external reference mutations for audit trails. The `old_external_ref`
+and `new_external_ref` fields capture the complete state transition (None→Some, Some→Some,
+Some→None), allowing off-chain systems to reconcile policy metadata across multiple updates.
+
+Topic: `("pol", "ext_upd")`
+
 ---
 
 ## Error Codes
@@ -334,13 +438,26 @@ RUST_TEST_THREADS=1 cargo test -p insurance --test gas_bench -- --nocapture
 ### Expected output (all tests passing)
 
 ```
-running 57 tests
+running 82 tests
 test tests::test_init_success ... ok
 test tests::test_create_health_policy_success ... ok
 ...
-test result: ok. 57 passed; 0 failed; 0 ignored
+test tests::test_set_external_ref_on_deactivated_policy_succeeds ... ok
+test result: ok. 82 passed; 0 failed; 0 ignored
 ```
 
+The comprehensive test suite includes:
+- 4 basic external_ref tests (set, clear, authorization, length validation)
+- 18 exhaustive external_ref mutation tests covering:
+  - Event emission validation
+  - State transitions (None→Some, Some→Some, Some→None)
+  - Idempotent and sequential mutations
+  - Persistence across policy operations
+  - Boundary conditions (min/max length)
+  - Empty string and special character handling
+  - Policy isolation and field preservation
+  - Deactivated policy behavior
+  - Authorization enforcement
 ---
 
 ## Integration Guide
@@ -397,129 +514,20 @@ external_ref.len() in 1..=128  (if supplied)
 4. **No self-referential calls** — this contract does not call back into itself
    or other contracts, eliminating classical reentrancy vectors.
 
-5. **Pre-mainnet gaps** (inherited from project-level THREAT_MODEL.md):
+5. **Pause controls** — the contract supports two layers of pause protection:
+   - **Global emergency pause** (`set_pause_all`): blocks ALL mutating operations.
+     The owner can always toggle this flag, even while the contract is paused.
+   - **Granular per-function pauses** (`set_pause_fn`): block only specific
+     functions (e.g. `"create"`, `"pay"`) while leaving others operational.
+   - **Priority rule**: the global pause always overrides per-function flags.
+   - **Read-only queries** (`get_policy`, `get_active_policies`,
+     `get_total_monthly_premium`, `is_paused`, `is_fn_paused`) are **never**
+     blocked by pause controls.
+   - Both pause toggle functions require `owner.require_auth()`, preventing
+     non-owner addresses from activating or deactivating pauses.
+
+6. **Pre-mainnet gaps** (inherited from project-level THREAT_MODEL.md):
    - `[SECURITY-003]` Rate limiting for emergency transfers is not yet implemented.
    - `[SECURITY-005]` MAX_POLICIES (1,000) provides a soft cap but no per-user limit.
-
-For security disclosures, email **security@remitwise.com**.
-
----
-
-## Security Assumptions
-
-This section documents the explicit trust assumptions and security properties
-of the **policy tagging system** (`add_tag` / `remove_tag`). Reviewers should
-verify each assumption holds before approving changes to this area.
-
-### SA-1 — Caller Identity is Verified by the Runtime
-
-`add_tag` and `remove_tag` both call `caller.require_auth()` as their **first**
-instruction. Soroban's host enforces this: if the transaction does not carry a
-valid signature for `caller`, the call is rejected before any contract logic
-runs. This means:
-
-- No tag mutation can occur without an on-chain signature from an authorised address.
-- The contract never trusts a caller address passed as a parameter without
-  verifying it cryptographically.
-
-### SA-2 — Two-Role Authorization Model
-
-Tag mutation is restricted to exactly two roles:
-
-| Role           | How it is determined                                      |
-|----------------|-----------------------------------------------------------|
-| **Policy owner** | `policy.owner == caller` — set immutably at `create_policy` time |
-| **Admin**        | `KEY_ADMIN` storage slot — set via `set_admin`, which itself requires the current admin's signature |
-
-Any address that is neither the policy owner nor the admin will hit the
-`panic!("unauthorized")` guard. There is no privilege escalation path between
-roles: an admin cannot change who owns a policy, and a policy owner cannot
-grant themselves admin rights.
-
-### SA-3 — Deduplication Prevents State Bloat
-
-**How it works:**
-
-Before appending a new tag, `add_tag` performs a linear scan of the policy's
-existing `tags: Vec<String>`:
-
-```
-for existing in policy.tags.iter() {
-    if existing == tag {
-        return;   // ← early exit, no write, no event
-    }
-}
-```
-
-If a match is found the function returns immediately — **no storage write
-occurs and no event is emitted**. This means:
-
-- A tag can appear at most once per policy, regardless of how many times
-  `add_tag` is called with the same value.
-- Repeated duplicate calls are free from a state-bloat perspective; they
-  consume ledger fees but produce no lasting effect.
-- The deduplication check is case-sensitive and byte-exact. `"active"` and
-  `"ACTIVE"` are treated as distinct tags.
-
-**Why this matters for security:**
-
-Without deduplication, a malicious or buggy caller could inflate the `tags`
-vector to an arbitrary size, increasing the storage footprint of every policy
-read/write and potentially causing out-of-gas failures for legitimate users.
-The linear scan is O(n) in the number of existing tags, which is bounded by
-the 32-character tag length limit and the practical cost of adding each tag.
-
-### SA-4 — Graceful Removal (No Panic on Missing Tag)
-
-`remove_tag` does **not** panic when the requested tag is absent. Instead it:
-
-1. Completes the full authorization check (SA-1, SA-2 still apply).
-2. Emits a `("insure", "tag_miss")` event carrying `(policy_id, tag)`.
-3. Returns without modifying storage.
-
-This design choice prevents a denial-of-service vector where an attacker
-front-runs a legitimate `remove_tag` call with their own `remove_tag` for the
-same tag, causing the legitimate call to panic and the transaction to fail.
-
-### SA-5 — Tag Length Validation
-
-Every tag is validated before any storage access:
-
-```
-if tag.len() == 0 || tag.len() > 32 {
-    panic!("tag must be 1–32 characters");
-}
-```
-
-This guard runs **before** the authorization check intentionally — it is a
-cheap, stateless validation that rejects obviously malformed inputs without
-touching storage. The 32-character ceiling limits the per-tag storage cost and
-keeps the deduplication scan fast.
-
-### SA-6 — Tags Do Not Affect Policy Lifecycle
-
-Tags are metadata only. They have no effect on:
-
-- Whether a policy is active or inactive.
-- Whether a premium payment is accepted.
-- The `next_payment_date` calculation.
-- The `get_total_monthly_premium` aggregation.
-
-A reviewer can therefore audit the tagging system in isolation without
-reasoning about interactions with the premium payment or deactivation logic.
-
-### SA-7 — Event Integrity
-
-Every successful tag mutation emits exactly one event:
-
-| Operation                  | Topic symbol  | Data              |
-|----------------------------|---------------|-------------------|
-| Tag added (new)            | `tag_added`   | `(policy_id, tag)` |
-| Tag removed (found)        | `tag_rmvd`    | `(policy_id, tag)` |
-| Tag removed (not found)    | `tag_miss`    | `(policy_id, tag)` |
-| Duplicate add (no-op)      | *(none)*      | —                 |
-
-The absence of an event on a duplicate add is intentional and tested. Off-chain
-indexers can rely on `tag_added` as a signal that storage was actually mutated.
 
 For security disclosures, email **security@remitwise.com**.
