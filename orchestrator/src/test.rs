@@ -209,36 +209,6 @@ fn assert_contract_error<T: core::fmt::Debug>(result: TryCall<T>, expected: Orch
     }
 }
 
-fn mock_direct_bill_payment_auth(
-    client: &OrchestratorClient,
-    env: &Env,
-    orchestrator_id: &Address,
-    caller: &Address,
-    amount: i128,
-    family_wallet_id: &Address,
-    bills_id: &Address,
-    bill_id: u32,
-    nonce: u64,
-) {
-    client.mock_auths(&[MockAuth {
-        address: caller,
-        invoke: &MockAuthInvoke {
-            contract: orchestrator_id,
-            fn_name: "execute_bill_payment",
-            args: (
-                caller.clone(),
-                amount,
-                family_wallet_id.clone(),
-                bills_id.clone(),
-                bill_id,
-                nonce,
-            )
-                .into_val(env),
-            sub_invokes: &[],
-        },
-    }]);
-}
-
 #[test]
 fn test_execute_remittance_flow_succeeds() {
     let (
@@ -399,20 +369,25 @@ fn test_execute_bill_payment_owner_direct_invoker_succeeds() {
     set_bill_owner(&env, &bills_id, 7, &user);
 
     let client = OrchestratorClient::new(&env, &orchestrator_id);
-    mock_direct_bill_payment_auth(
-        &client,
-        &env,
-        &orchestrator_id,
-        &user,
-        3_000,
-        &family_wallet_id,
-        &bills_id,
-        7,
-        1,
-    );
-
-    let result =
-        client.try_execute_bill_payment(&user, &3_000, &family_wallet_id, &bills_id, &7, &1u64);
+    let result = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &orchestrator_id,
+                fn_name: "execute_bill_payment",
+                args: (
+                    user.clone(),
+                    3_000i128,
+                    family_wallet_id.clone(),
+                    bills_id.clone(),
+                    7u32,
+                    1u64,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_execute_bill_payment(&user, &3_000, &family_wallet_id, &bills_id, &7, &1u64);
     assert_contract_ok(result);
 
     let bills_client = MockBillPaymentsClient::new(&env, &bills_id);
@@ -438,26 +413,25 @@ fn test_execute_bill_payment_rejects_argument_spoofing_without_owner_auth() {
     set_bill_owner(&env, &bills_id, 8, &user);
 
     let client = OrchestratorClient::new(&env, &orchestrator_id);
-    client.mock_auths(&[MockAuth {
-        address: &attacker,
-        invoke: &MockAuthInvoke {
-            contract: &orchestrator_id,
-            fn_name: "execute_bill_payment",
-            args: (
-                user.clone(),
-                3_000i128,
-                family_wallet_id.clone(),
-                bills_id.clone(),
-                8u32,
-                2u64,
-            )
-                .into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-
-    let result =
-        client.try_execute_bill_payment(&user, &3_000, &family_wallet_id, &bills_id, &8, &2u64);
+    let result = client
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &orchestrator_id,
+                fn_name: "execute_bill_payment",
+                args: (
+                    user.clone(),
+                    3_000i128,
+                    family_wallet_id.clone(),
+                    bills_id.clone(),
+                    8u32,
+                    2u64,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_execute_bill_payment(&user, &3_000, &family_wallet_id, &bills_id, &8, &2u64);
 
     assert!(result.is_err());
 
@@ -483,25 +457,14 @@ fn test_execute_bill_payment_blocks_forwarded_non_owner_delegation() {
     set_bill_owner(&env, &bills_id, 9, &user);
 
     let proxy_client = ForwardingProxyClient::new(&env, &proxy_id);
-    proxy_client.mock_auths(&[MockAuth {
-        address: &attacker,
-        invoke: &MockAuthInvoke {
-            contract: &proxy_id,
-            fn_name: "forward_execute_bill_payment",
-            args: (
-                orchestrator_id.clone(),
-                attacker.clone(),
-                3_000i128,
-                family_wallet_id.clone(),
-                bills_id.clone(),
-                9u32,
-                3u64,
-            )
-                .into_val(&env),
-            sub_invokes: &[MockAuthInvoke {
-                contract: &orchestrator_id,
-                fn_name: "execute_bill_payment",
+    let result = proxy_client
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &proxy_id,
+                fn_name: "forward_execute_bill_payment",
                 args: (
+                    orchestrator_id.clone(),
                     attacker.clone(),
                     3_000i128,
                     family_wallet_id.clone(),
@@ -510,20 +473,31 @@ fn test_execute_bill_payment_blocks_forwarded_non_owner_delegation() {
                     3u64,
                 )
                     .into_val(&env),
-                sub_invokes: &[],
-            }],
-        },
-    }]);
-
-    let result = proxy_client.try_forward_execute_bill_payment(
-        &orchestrator_id,
-        &attacker,
-        &3_000,
-        &family_wallet_id,
-        &bills_id,
-        &9,
-        &3u64,
-    );
+                sub_invokes: &[MockAuthInvoke {
+                    contract: &orchestrator_id,
+                    fn_name: "execute_bill_payment",
+                    args: (
+                        attacker.clone(),
+                        3_000i128,
+                        family_wallet_id.clone(),
+                        bills_id.clone(),
+                        9u32,
+                        3u64,
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[],
+                }],
+            },
+        }])
+        .try_forward_execute_bill_payment(
+            &orchestrator_id,
+            &attacker,
+            &3_000,
+            &family_wallet_id,
+            &bills_id,
+            &9,
+            &3u64,
+        );
 
     assert!(result.is_err());
 
@@ -549,26 +523,25 @@ fn test_execute_bill_payment_cross_user_execution_attempt_fails() {
     set_bill_owner(&env, &bills_id, 10, &user);
 
     let client = OrchestratorClient::new(&env, &orchestrator_id);
-    mock_direct_bill_payment_auth(
-        &client,
-        &env,
-        &orchestrator_id,
-        &attacker,
-        3_000,
-        &family_wallet_id,
-        &bills_id,
-        10,
-        4,
-    );
-
-    let result = client.try_execute_bill_payment(
-        &attacker,
-        &3_000,
-        &family_wallet_id,
-        &bills_id,
-        &10,
-        &4u64,
-    );
+    let result = client
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &orchestrator_id,
+                fn_name: "execute_bill_payment",
+                args: (
+                    attacker.clone(),
+                    3_000i128,
+                    family_wallet_id.clone(),
+                    bills_id.clone(),
+                    10u32,
+                    4u64,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_execute_bill_payment(&attacker, &3_000, &family_wallet_id, &bills_id, &10, &4u64);
 
     assert_contract_error(result, OrchestratorError::PermissionDenied);
 
@@ -594,34 +567,46 @@ fn test_execute_bill_payment_rejects_nonce_replay() {
     set_bill_owner(&env, &bills_id, 11, &user);
 
     let client = OrchestratorClient::new(&env, &orchestrator_id);
-    mock_direct_bill_payment_auth(
-        &client,
-        &env,
-        &orchestrator_id,
-        &user,
-        3_000,
-        &family_wallet_id,
-        &bills_id,
-        11,
-        55,
-    );
-    let first =
-        client.try_execute_bill_payment(&user, &3_000, &family_wallet_id, &bills_id, &11, &55u64);
+    let first = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &orchestrator_id,
+                fn_name: "execute_bill_payment",
+                args: (
+                    user.clone(),
+                    3_000i128,
+                    family_wallet_id.clone(),
+                    bills_id.clone(),
+                    11u32,
+                    55u64,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_execute_bill_payment(&user, &3_000, &family_wallet_id, &bills_id, &11, &55u64);
     assert_contract_ok(first);
 
-    mock_direct_bill_payment_auth(
-        &client,
-        &env,
-        &orchestrator_id,
-        &user,
-        3_000,
-        &family_wallet_id,
-        &bills_id,
-        11,
-        55,
-    );
-    let replayed =
-        client.try_execute_bill_payment(&user, &3_000, &family_wallet_id, &bills_id, &11, &55u64);
+    let replayed = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &orchestrator_id,
+                fn_name: "execute_bill_payment",
+                args: (
+                    user.clone(),
+                    3_000i128,
+                    family_wallet_id.clone(),
+                    bills_id.clone(),
+                    11u32,
+                    55u64,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_execute_bill_payment(&user, &3_000, &family_wallet_id, &bills_id, &11, &55u64);
 
     assert_contract_error(replayed, OrchestratorError::NonceAlreadyUsed);
 }
@@ -644,46 +629,46 @@ fn test_execute_bill_payment_accepts_distinct_nonces_for_same_owner() {
     set_bill_owner(&env, &bills_id, 12, &user);
 
     let client = OrchestratorClient::new(&env, &orchestrator_id);
-    mock_direct_bill_payment_auth(
-        &client,
-        &env,
-        &orchestrator_id,
-        &user,
-        3_000,
-        &family_wallet_id,
-        &bills_id,
-        12,
-        100,
-    );
-    let first = client.try_execute_bill_payment(
-        &user,
-        &3_000,
-        &family_wallet_id,
-        &bills_id,
-        &12,
-        &100u64,
-    );
+    let first = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &orchestrator_id,
+                fn_name: "execute_bill_payment",
+                args: (
+                    user.clone(),
+                    3_000i128,
+                    family_wallet_id.clone(),
+                    bills_id.clone(),
+                    12u32,
+                    100u64,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_execute_bill_payment(&user, &3_000, &family_wallet_id, &bills_id, &12, &100u64);
     assert_contract_ok(first);
 
-    mock_direct_bill_payment_auth(
-        &client,
-        &env,
-        &orchestrator_id,
-        &user,
-        3_000,
-        &family_wallet_id,
-        &bills_id,
-        12,
-        101,
-    );
-    let second = client.try_execute_bill_payment(
-        &user,
-        &3_000,
-        &family_wallet_id,
-        &bills_id,
-        &12,
-        &101u64,
-    );
+    let second = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &orchestrator_id,
+                fn_name: "execute_bill_payment",
+                args: (
+                    user.clone(),
+                    3_000i128,
+                    family_wallet_id.clone(),
+                    bills_id.clone(),
+                    12u32,
+                    101u64,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_execute_bill_payment(&user, &3_000, &family_wallet_id, &bills_id, &12, &101u64);
 
     assert_contract_ok(second);
 

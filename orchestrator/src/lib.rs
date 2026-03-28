@@ -296,7 +296,7 @@ impl Orchestrator {
     ) -> Result<(), OrchestratorError> {
         Self::acquire_execution_lock(&env)?;
         caller.require_auth();
-        let timestamp = env.ledger().timestamp();
+        let _timestamp = env.ledger().timestamp();
         // Address validation
         Self::validate_two_addresses(&env, &family_wallet_addr, &savings_addr).map_err(|e| {
             Self::release_execution_lock(&env);

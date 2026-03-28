@@ -150,7 +150,7 @@ Incoming Remittance → remittance_split → [savings_goals, bill_payments, insu
 
 **Attack Vector:**
 1. A non-owner or helper contract forwards a signed bill-payment request for a victim
-2. The orchestrator trusts the `caller` argument without confirming the victim is also the direct invoker
+2. The orchestrator trusts the `caller` argument without confirming the caller is the stored family wallet owner
 3. Downstream execution proceeds unless another layer blocks it
 
 **Impact:** Unauthorized fund allocation, state manipulation
@@ -1534,25 +1534,25 @@ Six dedicated nonce tests cover: replay rejection per command type, nonce isolat
 `orchestrator::execute_bill_payment()` accepted a user-supplied `caller` address and required that address to authorize, but it did not explicitly reject execution forwarded through another contract. That left room for confused-deputy behavior where a non-owner caller could attempt to relay a victim-approved authorization path.
 
 ### Trust Boundary
-- The only trusted principal for `execute_bill_payment()` is the address supplied as `caller`.
-- That principal must both authorize the call and be the direct invoker observed by the orchestrator.
+- The only trusted principal for `execute_bill_payment()` is the family wallet owner returned by `family_wallet_addr`.
+- The authenticated `caller` must match that stored owner before bill execution proceeds.
 - The downstream `bill_payments` contract still enforces bill ownership, but the orchestrator now rejects forwarded execution before reaching that layer.
 
 ### Allowed Callers
 - Direct owner calls are allowed.
-- Non-owner forwarding through helper or proxy contracts is rejected with `OrchestratorError::PermissionDenied`.
+- Non-owner forwarding through helper or proxy contracts is rejected because the forwarded `caller` still must equal the stored family wallet owner.
 - No general delegation model is supported for `execute_bill_payment()`.
 
 ### Delegation Model
 Delegation is intentionally unsupported for this entry point. A non-owner cannot self-assert authority by:
 - passing an owner address in `caller`
-- forwarding a victim-signed invocation through another contract
+- forwarding a call as a non-owner through another contract
 - replaying a previously authorized payload with the same nonce
 
 ### Mitigated Attack Scenarios
-- Non-owner forwarding: blocked by requiring `caller == env.invoker()` in addition to `caller.require_auth()`.
+- Non-owner forwarding: blocked by requiring `caller.require_auth()` and `caller == family_wallet.get_owner()`.
 - Argument spoofing: blocked because supplying another user's address without that user's direct authorization fails authentication.
-- Unauthorized delegated execution: blocked because intermediate contract invocation is rejected even when the caller argument is otherwise valid.
+- Unauthorized delegated execution: blocked because there is no delegate allowlist and every caller must match the stored owner address.
 
 ### Assumptions And Residual Risks
 - `bill_payments::pay_bill()` remains the source of truth for bill ownership and must continue rejecting non-owners.
