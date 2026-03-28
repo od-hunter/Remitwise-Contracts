@@ -25,6 +25,7 @@ in strict order before any token interaction occurs:
    Returns `SelfTransferNotAllowed` if any match.
 7. **Replay protection** — nonce must equal `get_nonce(from)` and is incremented after success.
 8. **Audit + event** — a `DistributionCompleted` event is emitted on success for off-chain indexing.
+9. **Schedule ID Sequencing** — `create_remittance_schedule` generates strictly monotonic IDs using a synchronized counter (`NEXT_RSCH`), ensuring no collisions across high-volume operations.
 
 ## Features
 

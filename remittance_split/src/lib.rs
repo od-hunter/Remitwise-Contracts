@@ -1341,8 +1341,16 @@ impl RemittanceSplit {
             .storage()
             .instance()
             .get(&symbol_short!("NEXT_RSCH"))
-            .unwrap_or(0u32)
-            + 1;
+            .unwrap_or(0u32);
+            
+        let next_schedule_id = current_max_id
+            .checked_add(1)
+            .ok_or(RemittanceSplitError::Overflow)?;
+
+        // Explicit uniqueness check to prevent any potential storage collisions
+        if schedules.contains_key(next_schedule_id) {
+            return Err(RemittanceSplitError::Overflow); // Should be unreachable with monotonic counter
+        }
 
         let schedule = RemittanceSchedule {
             id: next_schedule_id,
