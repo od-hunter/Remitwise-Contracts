@@ -77,6 +77,7 @@ pub struct EmergencyConfig {
     pub max_amount: i128,
     pub cooldown: u64,
     pub min_balance: i128,
+    pub daily_limit: i128,
 }
 
 #[contracttype]
@@ -138,6 +139,9 @@ pub struct AccessAuditEntry {
 const CONTRACT_VERSION: u32 = 1;
 const MAX_ACCESS_AUDIT_ENTRIES: u32 = 100;
 const MAX_BATCH_MEMBERS: u32 = 30;
+const MAX_SIGNERS: u32 = 100;
+const MIN_THRESHOLD: u32 = 1;
+const MAX_THRESHOLD: u32 = 100;
 
 #[contracttype]
 #[derive(Clone)]
@@ -184,8 +188,12 @@ pub enum Error {
     MemberNotFound = 11,
     TransactionAlreadyExecuted = 12,
     InvalidSpendingLimit = 13,
-    TransactionCancelled = 14,
-    InvalidExpiryDuration = 15,
+    ThresholdBelowMinimum = 14,
+    ThresholdAboveMaximum = 15,
+    SignersListEmpty = 16,
+    SignerNotMember = 17,
+    DuplicateSigner = 18,
+    TooManySigners = 19,
 }
 
 #[contractimpl]
@@ -264,22 +272,20 @@ impl FamilyWallet {
             .instance()
             .set(&symbol_short!("NEXT_TX"), &1u64);
 
-        env.storage().instance().set(
-            &symbol_short!("EM_CONF"),
-            &EmergencyConfig {
-                max_amount: 1000_0000000,
-                cooldown: 3600,
-                min_balance: 0,
-            },
-        );
-
+        let em_config = EmergencyConfig {
+            max_amount: 10000_0000000,
+            cooldown: 3600,
+            min_balance: 0,
+            daily_limit: 100000_0000000,
+        };
         env.storage()
             .instance()
-            .set(&symbol_short!("PROP_EXP"), &DEFAULT_PROPOSAL_EXPIRY);
+            .set(&symbol_short!("EM_CONF"), &em_config);
 
         env.storage()
             .instance()
             .set(&symbol_short!("EM_MODE"), &false);
+
         env.storage()
             .instance()
             .set(&symbol_short!("EM_LAST"), &0u64);
@@ -287,77 +293,6 @@ impl FamilyWallet {
         true
     }
 
-    /// @notice Set the duration after which a multisig proposal expires.
-    /// @dev Only Owner or Admin can set the expiry duration.
-    /// @param caller Admin/Owner authorizing the change.
-    /// @param duration Unix duration in seconds (max 7 days).
-    pub fn set_proposal_expiry(env: Env, caller: Address, duration: u64) -> Result<bool, Error> {
-        caller.require_auth();
-        Self::require_not_paused(&env);
-
-        if !Self::is_owner_or_admin(&env, &caller) {
-            return Err(Error::Unauthorized);
-        }
-
-        if duration == 0 || duration > MAX_PROPOSAL_EXPIRY {
-            return Err(Error::InvalidExpiryDuration);
-        }
-
-        Self::extend_instance_ttl(&env);
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("PROP_EXP"), &duration);
-
-        Ok(true)
-    }
-
-    pub fn get_proposal_expiry_public(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&symbol_short!("PROP_EXP"))
-            .unwrap_or(DEFAULT_PROPOSAL_EXPIRY)
-    }
-
-    /// @notice Cancel a pending multisig proposal.
-    /// @dev Only the original proposer or an Admin/Owner can cancel a proposal.
-    /// @param caller Proposer or Admin/Owner.
-    /// @param tx_id The ID of the transaction to cancel.
-    pub fn cancel_transaction(env: Env, caller: Address, tx_id: u64) -> Result<bool, Error> {
-        caller.require_auth();
-        Self::require_not_paused(&env);
-
-        let mut pending_txs: Map<u64, PendingTransaction> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("PEND_TXS"))
-            .ok_or(Error::TransactionNotFound)?;
-
-        let tx = pending_txs.get(tx_id).ok_or(Error::TransactionNotFound)?;
-
-        let is_proposer = tx.proposer == caller;
-        let is_admin = Self::is_owner_or_admin(&env, &caller);
-
-        if !is_proposer && !is_admin {
-            return Err(Error::Unauthorized);
-        }
-
-        Self::extend_instance_ttl(&env);
-
-        pending_txs.remove(tx_id);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("PEND_TXS"), &pending_txs);
-
-        Self::update_storage_stats(&env);
-
-        env.events().publish(
-            (symbol_short!("wallet"), ArchiveEvent::TransactionCancelled),
-            (tx_id, caller),
-        );
-
-        Ok(true)
-    }
 
     pub fn add_member(
         env: Env,
@@ -519,6 +454,15 @@ impl FamilyWallet {
         amount <= member.spending_limit
     }
 
+    /// @notice Configure multisig parameters for a given transaction type.
+    /// @dev Validates threshold bounds, signer membership, and uniqueness.
+    ///      Returns `Result<bool, Error>` instead of panicking on invalid input.
+    /// @param caller Owner or Admin authorizing the configuration.
+    /// @param tx_type The transaction type to configure.
+    /// @param threshold Number of signatures required (MIN_THRESHOLD..=min(MAX_THRESHOLD, signer_count)).
+    /// @param signers List of authorized signers (must be family members, no duplicates).
+    /// @param spending_limit Non-negative spending cap for the configuration.
+    /// @return Ok(true) on success, or a specific Error variant on failure.
     pub fn configure_multisig(
         env: Env,
         caller: Address,
@@ -526,7 +470,7 @@ impl FamilyWallet {
         threshold: u32,
         signers: Vec<Address>,
         spending_limit: i128,
-    ) -> bool {
+    ) -> Result<bool, Error> {
         caller.require_auth();
         Self::require_not_paused(&env);
 
@@ -537,23 +481,45 @@ impl FamilyWallet {
             .unwrap_or_else(|| panic!("Wallet not initialized"));
 
         if !Self::is_owner_or_admin_in_members(&env, &members, &caller) {
-            panic!("Only Owner or Admin can configure multi-sig");
+            return Err(Error::Unauthorized);
         }
 
-        // Validate threshold
         let signer_count = signers.len();
-        if threshold == 0 || threshold > signer_count {
-            panic!("Invalid threshold");
+
+        if signer_count == 0 {
+            return Err(Error::SignersListEmpty);
         }
 
+        if signer_count > MAX_SIGNERS {
+            return Err(Error::TooManySigners);
+        }
+
+        if threshold < MIN_THRESHOLD {
+            return Err(Error::ThresholdBelowMinimum);
+        }
+
+        if threshold > MAX_THRESHOLD {
+            return Err(Error::ThresholdAboveMaximum);
+        }
+
+        if threshold > signer_count {
+            return Err(Error::InvalidThreshold);
+        }
+
+        // Check signer membership and uniqueness in a single pass
+        let mut checked: Map<Address, bool> = Map::new(&env);
         for signer in signers.iter() {
             if members.get(signer.clone()).is_none() {
-                panic!("Signer must be a family member");
+                return Err(Error::SignerNotMember);
             }
+            if checked.get(signer.clone()).is_some() {
+                return Err(Error::DuplicateSigner);
+            }
+            checked.set(signer.clone(), true);
         }
 
         if spending_limit < 0 {
-            panic!("Spending limit must be non-negative");
+            return Err(Error::InvalidSpendingLimit);
         }
 
         Self::extend_instance_ttl(&env);
@@ -568,7 +534,7 @@ impl FamilyWallet {
             .instance()
             .set(&Self::get_config_key(tx_type), &config);
 
-        true
+        Ok(true)
     }
 
     pub fn propose_transaction(
@@ -886,6 +852,7 @@ impl FamilyWallet {
         max_amount: i128,
         cooldown: u64,
         min_balance: i128,
+        daily_limit: i128,
     ) -> bool {
         caller.require_auth();
         Self::require_not_paused(&env);
@@ -908,6 +875,7 @@ impl FamilyWallet {
                 max_amount,
                 cooldown,
                 min_balance,
+                daily_limit,
             },
         );
 
@@ -1342,7 +1310,7 @@ impl FamilyWallet {
         // Emit admin transfer event for audit trail
         env.events().publish(
             (symbol_short!("family"), symbol_short!("adm_xfr")),
-            (current_upgrade_admin, new_admin.clone()),
+            (current_upgrade_admin.clone(), new_admin.clone()),
         );
 
         true
@@ -1522,6 +1490,22 @@ impl FamilyWallet {
             panic!("Emergency transfer cooldown period not elapsed");
         }
 
+        // Daily Rate Limit Enforcement
+        let day_in_seconds = 86400u64;
+        let mut daily_usage: (i128, u64) = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("EM_VOL"))
+            .unwrap_or((0i128, 0u64));
+
+        if now >= daily_usage.1.saturating_add(day_in_seconds) {
+            daily_usage = (0i128, now);
+        }
+
+        if daily_usage.0.saturating_add(amount) > config.daily_limit {
+            panic!("Emergency daily limit exceeded");
+        }
+
         let token_client = TokenClient::new(&env, &token);
         let current_balance = token_client.balance(&proposer);
         if current_balance - amount < config.min_balance {
@@ -1546,6 +1530,11 @@ impl FamilyWallet {
         env.storage()
             .instance()
             .set(&symbol_short!("EM_LAST"), &store_ts);
+
+        daily_usage.0 = daily_usage.0.saturating_add(amount);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("EM_VOL"), &daily_usage);
 
         env.events().publish(
             (symbol_short!("emerg"), EmergencyEvent::TransferExec),
