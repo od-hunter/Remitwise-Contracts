@@ -464,6 +464,14 @@
                           },
                           {
                             "key": {
+                              "symbol": "data_availability"
+                            },
+                            "val": {
+                              "u32": 0
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "period_end"
                             },
                             "val": {
@@ -1055,6 +1063,14 @@
                                                 ]
                                               }
                                             ]
+                                          }
+                                        },
+                                        {
+                                          "key": {
+                                            "symbol": "data_availability"
+                                          },
+                                          "val": {
+                                            "u32": 0
                                           }
                                         },
                                         {
@@ -3466,6 +3482,14 @@
                       },
                       {
                         "key": {
+                          "symbol": "data_availability"
+                        },
+                        "val": {
+                          "u32": 0
+                        }
+                      },
+                      {
+                        "key": {
                           "symbol": "period_end"
                         },
                         "val": {
@@ -3966,6 +3990,14 @@
                                   ]
                                 }
                               ]
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "data_availability"
+                            },
+                            "val": {
+                              "u32": 0
                             }
                           },
                           {

@@ -465,6 +465,14 @@
                           },
                           {
                             "key": {
+                              "symbol": "data_availability"
+                            },
+                            "val": {
+                              "u32": 0
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "period_end"
                             },
                             "val": {
@@ -815,7 +823,7 @@
             },
             "ext": "v0"
           },
-          518401
+          100000
         ]
       ],
       [
@@ -1129,7 +1137,7 @@
             },
             "ext": "v0"
           },
-          518401
+          100000
         ]
       ]
     ]
@@ -3171,6 +3179,14 @@
                       },
                       {
                         "key": {
+                          "symbol": "data_availability"
+                        },
+                        "val": {
+                          "u32": 0
+                        }
+                      },
+                      {
+                        "key": {
                           "symbol": "period_end"
                         },
                         "val": {
@@ -3671,6 +3687,14 @@
                                   ]
                                 }
                               ]
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "data_availability"
+                            },
+                            "val": {
+                              "u32": 0
                             }
                           },
                           {

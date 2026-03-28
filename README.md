@@ -409,6 +409,15 @@ Bill and insurance events include `external_ref` where applicable for off-chain 
 
 Bill and insurance events include `external_ref` where applicable for off-chain linking.
 
+### Reporting
+
+Provides summarized views of user financial data across all ecosystem contracts.
+
+**Key Features:**
+
+- `get_remittance_summary`: Aggregates split, savings, bills, and insurance data into a single summary
+- **Graceful Degradation**: Implements a `DataAvailability` indicator (`Complete`, `Partial`, `Missing`) ensuring summary queries return available data without a hard panic if upstream contracts are unresponsive, unconfigured, or fail.
+
 ### Family Wallet
 
 Manages family roles, spending controls, multisig approvals, and emergency transfer policies.
