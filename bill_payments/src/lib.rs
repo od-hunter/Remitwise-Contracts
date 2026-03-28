@@ -929,8 +929,11 @@ impl BillPayments {
             .instance()
             .set(&symbol_short!("BILLS"), &bills);
 
-        env.events().publish(
-            (symbol_short!("bill"), BillEvent::ExternalRefUpdated),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Medium,
+            symbol_short!("ext_ref"),
             (bill_id, caller, external_ref),
         );
 

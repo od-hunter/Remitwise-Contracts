@@ -7,6 +7,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient, vec,
     Address, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
+use remitwise_common::{EventCategory, EventPriority, RemitwiseEvents};
 
 // Event topics
 const SPLIT_INITIALIZED: Symbol = symbol_short!("init");
@@ -277,8 +278,13 @@ impl RemittanceSplit {
         env.storage()
             .instance()
             .set(&symbol_short!("PAUSED"), &true);
-        env.events()
-            .publish((symbol_short!("split"), symbol_short!("paused")), ());
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::System,
+            EventPriority::High,
+            symbol_short!("paused"),
+            (),
+        );
         Ok(())
     }
 
@@ -306,8 +312,13 @@ impl RemittanceSplit {
         env.storage()
             .instance()
             .set(&symbol_short!("PAUSED"), &false);
-        env.events()
-            .publish((symbol_short!("split"), symbol_short!("unpaused")), ());
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::System,
+            EventPriority::High,
+            symbol_short!("unpaused"),
+            (),
+        );
         Ok(())
     }
     pub fn is_paused(env: Env) -> bool {
@@ -420,8 +431,11 @@ impl RemittanceSplit {
         env.storage()
             .instance()
             .set(&symbol_short!("VERSION"), &new_version);
-        env.events().publish(
-            (symbol_short!("split"), symbol_short!("upgraded")),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::System,
+            EventPriority::High,
+            symbol_short!("upgraded"),
             (prev, new_version),
         );
         Ok(())
@@ -515,8 +529,13 @@ impl RemittanceSplit {
 
         Self::increment_nonce(&env, &owner)?;
         Self::append_audit(&env, symbol_short!("init"), &owner, true);
-        env.events()
-            .publish((symbol_short!("split"), SplitEvent::Initialized), owner);
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Medium,
+            symbol_short!("init"),
+            owner,
+        );
 
         Ok(true)
     }
@@ -642,9 +661,18 @@ impl RemittanceSplit {
             insurance_amount: insurance,
             timestamp: env.ledger().timestamp(),
         };
-        env.events().publish((SPLIT_CALCULATED,), event);
-        env.events().publish(
-            (symbol_short!("split"), SplitEvent::Calculated),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::Low,
+            symbol_short!("calc"),
+            event,
+        );
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::Low,
+            symbol_short!("calc_raw"),
             total_amount,
         );
 
@@ -762,8 +790,11 @@ impl RemittanceSplit {
         // 10. Advance nonce, record audit, emit event.
         Self::increment_nonce(&env, &from)?;
         Self::append_audit(&env, symbol_short!("distrib"), &from, true);
-        env.events().publish(
-            (symbol_short!("split"), SplitEvent::DistributionCompleted),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::Medium,
+            symbol_short!("dist_ok"),
             (from, total_amount),
         );
 
@@ -1333,9 +1364,18 @@ impl RemittanceSplit {
                 insurance_amount: insurance,
                 timestamp: env.ledger().timestamp(),
             };
-            env.events().publish((SPLIT_CALCULATED,), event);
-            env.events().publish(
-                (symbol_short!("split"), SplitEvent::Calculated),
+            RemitwiseEvents::emit(
+                &env,
+                EventCategory::Transaction,
+                EventPriority::Low,
+                symbol_short!("calc"),
+                event,
+            );
+            RemitwiseEvents::emit(
+                &env,
+                EventCategory::Transaction,
+                EventPriority::Low,
+                symbol_short!("calc_raw"),
                 total_amount,
             );
         }
@@ -1435,8 +1475,11 @@ impl RemittanceSplit {
             .instance()
             .set(&symbol_short!("NEXT_RSCH"), &next_schedule_id);
 
-        env.events().publish(
-            (symbol_short!("schedule"), ScheduleEvent::Created),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Medium,
+            symbol_short!("sch_new"),
             (next_schedule_id, owner),
         );
 
@@ -1499,8 +1542,11 @@ impl RemittanceSplit {
             .persistent()
             .extend_ttl(&DataKey::Schedule(schedule_id), INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
-        env.events().publish(
-            (symbol_short!("schedule"), ScheduleEvent::Modified),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Medium,
+            symbol_short!("sch_mod"),
             (schedule_id, caller),
         );
 
@@ -1543,8 +1589,11 @@ impl RemittanceSplit {
             .persistent()
             .extend_ttl(&DataKey::Schedule(schedule_id), INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
-        env.events().publish(
-            (symbol_short!("schedule"), ScheduleEvent::Cancelled),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Medium,
+            symbol_short!("sch_can"),
             (schedule_id, caller),
         );
 

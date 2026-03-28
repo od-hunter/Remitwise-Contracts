@@ -485,6 +485,7 @@ impl ReportingContract {
         period_start: u64,
         period_end: u64,
     ) -> RemittanceSummary {
+        user.require_auth();
         let addresses: ContractAddresses = env
             .storage()
             .instance()
@@ -861,9 +862,10 @@ impl ReportingContract {
     /// two data points are supplied.
     pub fn get_trend_analysis_multi(
         env: Env,
-        _user: Address,
+        user: Address,
         history: Vec<(u64, i128)>,
     ) -> Vec<TrendData> {
+        user.require_auth();
         let mut result = Vec::new(&env);
         let len = history.len();
         if len < 2 {

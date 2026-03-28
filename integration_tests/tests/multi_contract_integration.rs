@@ -38,7 +38,7 @@ impl MockRemittanceSplit {
         let savings = (total_amount * 30) / 100;
         let bills = (total_amount * 20) / 100;
         let insurance = total_amount - spending - savings - bills; // remainder
-        SorobanVec::from_array(&env, [spending, savings, bills, insurance])
+        Vec::from_array(&env, [spending, savings, bills, insurance])
     }
 }
 
@@ -161,7 +161,8 @@ fn test_multi_contract_user_flow() {
     let insurance_client = InsuranceClient::new(&env, &insurance_contract_id);
 
     let nonce = 0u64;
-    remittance_client.initialize_split(&user, &nonce, &40u32, &30u32, &20u32, &10u32);
+    let mock_usdc = Address::generate(&env);
+    remittance_client.initialize_split(&user, &nonce, &mock_usdc, &40u32, &30u32, &20u32, &10u32);
 
     let goal_name = SorobanString::from_str(&env, "Education Fund");
     let target_amount = 10_000i128;
@@ -188,7 +189,7 @@ fn test_multi_contract_user_flow() {
     let policy_id = insurance_client.create_policy(
         &user,
         &SorobanString::from_str(&env, "Health Insurance"),
-        &SorobanString::from_str(&env, "health"),
+        &CoverageType::Health,
         &200i128,
         &50_000i128,
     );
@@ -234,11 +235,12 @@ fn test_split_with_rounding() {
     env.mock_all_auths();
 
     let user = Address::generate(&env);
+    let mock_usdc = Address::generate(&env);
 
     let remittance_contract_id = env.register_contract(None, RemittanceSplit);
     let remittance_client = RemittanceSplitClient::new(&env, &remittance_contract_id);
 
-    remittance_client.initialize_split(&user, &0u64, &33u32, &33u32, &17u32, &17u32);
+    remittance_client.initialize_split(&user, &0u64, &mock_usdc, &33u32, &33u32, &17u32, &17u32);
 
     let total = 1_000i128;
     let amounts = remittance_client.calculate_split(&total);
@@ -581,7 +583,8 @@ fn test_integration_accounting_split_sums_to_total() {
     let remittance_id = env.register_contract(None, RemittanceSplit);
     let remittance_client = RemittanceSplitClient::new(&env, &remittance_id);
 
-    remittance_client.initialize_split(&user, &0u64, &40u32, &30u32, &20u32, &10u32);
+    let mock_usdc = Address::generate(&env);
+    remittance_client.initialize_split(&user, &0u64, &mock_usdc, &40u32, &30u32, &20u32, &10u32);
 
     for total in [1_000i128, 9_999i128, 10_000i128, 77_777i128] {
         let amounts = remittance_client.calculate_split(&total);
@@ -942,7 +945,8 @@ fn test_event_topic_compliance_across_contracts() {
     let insurance_client = InsuranceClient::new(&env, &insurance_id);
 
     // Trigger events in each contract
-    remittance_client.initialize_split(&user, &0u64, &40u32, &30u32, &20u32, &10u32);
+    let mock_usdc = Address::generate(&env);
+    remittance_client.initialize_split(&user, &0u64, &mock_usdc, &40u32, &30u32, &20u32, &10u32);
 
     let goal_name = SorobanString::from_str(&env, "Compliance Goal");
     let _ = savings_client.create_goal(
@@ -960,12 +964,12 @@ fn test_event_topic_compliance_across_contracts() {
         &(env.ledger().timestamp() + 86400),
         &true,
         &30u32,
+        &None,
         &SorobanString::from_str(&env, "XLM"),
     );
 
     let policy_name = SorobanString::from_str(&env, "Compliance Policy");
-    let coverage_type = SorobanString::from_str(&env, "health");
-    let _ = insurance_client.create_policy(&user, &policy_name, &coverage_type, &50i128, &1000i128);
+    let _ = insurance_client.create_policy(&user, &policy_name, &CoverageType::Health, &50i128, &1000i128);
 
     // Collect published events
     let events = env.events().all();
@@ -984,6 +988,7 @@ fn test_event_topic_compliance_across_contracts() {
             && topics.get(0).unwrap() == symbol_short!("Remitwise").into_val(&env);
         if !ok {
             non_compliant.push_back(ev.clone());
+            eprintln!("Non-compliant event found: Topics={:?}, Data={:?}", topics, ev.2);
         }
     }
 

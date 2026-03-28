@@ -14,6 +14,7 @@ use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
     symbol_short, Address, Env, Symbol, Vec,
 };
+use remitwise_common::{EventCategory, EventPriority, RemitwiseEvents};
 
 #[cfg(test)]
 mod test;
