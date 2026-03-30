@@ -19,6 +19,7 @@ members = [
 
     "testutils",
     "integration_tests",
+    "remitwise-common",
 
    
 ]
