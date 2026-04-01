@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #[cfg(test)]
 mod test;
@@ -95,8 +96,6 @@ pub struct SplitAuthPayload {
 // Storage TTL constants
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280; // ~1 day
 const INSTANCE_BUMP_AMOUNT: u32 = 518400; // ~30 days
-/// Key for the per-address used-nonce bitmap (Map<Address, Vec<u64>>).
-const USED_NONCES_KEY: &str = "USED_N";
 /// Maximum number of used nonces tracked per address before the oldest are pruned.
 const MAX_USED_NONCES_PER_ADDR: u32 = 256;
 /// Maximum ledger seconds a signed request may remain valid after creation.
@@ -275,8 +274,6 @@ fn clamp_limit(limit: u32) -> u32 {
     }
 }
 const MAX_AUDIT_ENTRIES: u32 = 100;
-const DEFAULT_PAGE_LIMIT: u32 = 20;
-const MAX_PAGE_LIMIT: u32 = 50;
 const CONTRACT_VERSION: u32 = 1;
 
 #[contracttype]
@@ -608,7 +605,12 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::AlreadyInitialized);
         }
 
-        if let Err(e) = Self::validate_percentages(spending_percent, savings_percent, bills_percent, insurance_percent) {
+        if let Err(_e) = Self::validate_percentages(
+            spending_percent,
+            savings_percent,
+            bills_percent,
+            insurance_percent,
+        ) {
             Self::append_audit(&env, symbol_short!("init"), &owner, false);
             return Err(RemittanceSplitError::InvalidPercentages);
         }
@@ -677,7 +679,12 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::Unauthorized);
         }
 
-        if let Err(e) = Self::validate_percentages(spending_percent, savings_percent, bills_percent, insurance_percent) {
+        if let Err(_e) = Self::validate_percentages(
+            spending_percent,
+            savings_percent,
+            bills_percent,
+            insurance_percent,
+        ) {
             Self::append_audit(&env, symbol_short!("update"), &caller, false);
             return Err(RemittanceSplitError::InvalidPercentages);
         }
@@ -740,9 +747,18 @@ impl RemittanceSplit {
         }
 
         let split = Self::get_split(&env);
-        let s0 = split.get(0).unwrap() as i128;
-        let s1 = split.get(1).unwrap() as i128;
-        let s2 = split.get(2).unwrap() as i128;
+        let s0 = match split.get(0) {
+            Some(v) => v as i128,
+            None => return Err(RemittanceSplitError::Overflow),
+        };
+        let s1 = match split.get(1) {
+            Some(v) => v as i128,
+            None => return Err(RemittanceSplitError::Overflow),
+        };
+        let s2 = match split.get(2) {
+            Some(v) => v as i128,
+            None => return Err(RemittanceSplitError::Overflow),
+        };
 
         let spending = total_amount
             .checked_mul(s0)
@@ -777,7 +793,7 @@ impl RemittanceSplit {
             &env,
             EventCategory::Transaction,
             EventPriority::Low,
-            symbol_short!("calc"),
+            SPLIT_CALCULATED,
             event,
         );
         RemitwiseEvents::emit(
@@ -1056,7 +1072,7 @@ impl RemittanceSplit {
         let current_time = env.ledger().timestamp();
         if snapshot.config.timestamp > current_time {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
-            return Err(RemittanceSplitError::FutureTimestamp);
+            return Err(RemittanceSplitError::InvalidDueDate);
         }
 
         // 7. Caller must be the current contract owner.
@@ -1073,7 +1089,7 @@ impl RemittanceSplit {
         // 8. Ownership mapping — prevent silent ownership transfer via snapshot.
         if snapshot.config.owner != caller {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
-            return Err(RemittanceSplitError::OwnerMismatch);
+            return Err(RemittanceSplitError::Unauthorized);
         }
 
         Self::extend_instance_ttl(&env);
@@ -1478,14 +1494,14 @@ impl RemittanceSplit {
                 timestamp: env.ledger().timestamp(),
             };
             RemitwiseEvents::emit(
-                &env,
+                env,
                 EventCategory::Transaction,
                 EventPriority::Low,
-                symbol_short!("calc"),
+                SPLIT_CALCULATED,
                 event,
             );
             RemitwiseEvents::emit(
-                &env,
+                env,
                 EventCategory::Transaction,
                 EventPriority::Low,
                 symbol_short!("calc_raw"),

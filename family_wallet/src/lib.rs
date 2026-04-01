@@ -60,6 +60,46 @@ pub enum TransactionData {
     PolicyCancellation(u32),
 }
 
+/// Spending period configuration for rollover behavior
+#[contracttype]
+#[derive(Clone)]
+pub struct SpendingPeriod {
+    /// Period type: 0=Daily, 1=Weekly, 2=Monthly
+    pub period_type: u32,
+    /// Period start timestamp (aligned to period boundary)
+    pub period_start: u64,
+    /// Period duration in seconds
+    pub period_duration: u64,
+}
+
+/// Cumulative spending tracking for precision validation
+#[contracttype]
+#[derive(Clone)]
+pub struct SpendingTracker {
+    pub current_spent: i128,
+    pub last_tx_timestamp: u64,
+    pub tx_count: u32,
+    pub period: SpendingPeriod,
+}
+
+/// Enhanced spending limit with precision controls
+#[contracttype]
+#[derive(Clone)]
+pub struct PrecisionSpendingLimit {
+    pub limit: i128,
+    pub min_precision: i128,
+    pub max_single_tx: i128,
+    pub enable_rollover: bool,
+}
+
+/// Soroban `contracttype` does not support `Option<CustomStruct>`; use this instead of `Option`.
+#[contracttype]
+#[derive(Clone)]
+pub enum PrecisionLimitOpt {
+    None,
+    Some(PrecisionSpendingLimit),
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct FamilyMember {
@@ -114,6 +154,19 @@ pub struct ArchivedTransaction {
     pub proposer: Address,
     pub executed_at: u64,
     pub archived_at: u64,
+}
+
+/// Metadata for multisig-completed executions retained in `EXEC_TXS` until archived.
+///
+/// **Security:** `tx_id` must match the map key; mismatch indicates storage corruption
+/// and must abort archiving (`archive_old_transactions`).
+#[contracttype]
+#[derive(Clone)]
+pub struct ExecutedTxMeta {
+    pub tx_id: u64,
+    pub tx_type: TransactionType,
+    pub proposer: Address,
+    pub executed_at: u64,
 }
 
 #[contracttype]
@@ -299,9 +352,10 @@ impl FamilyWallet {
             &Map::<u64, PendingTransaction>::new(&env),
         );
 
-        env.storage()
-            .instance()
-            .set(&symbol_short!("EXEC_TXS"), &Map::<u64, bool>::new(&env));
+        env.storage().instance().set(
+            &symbol_short!("EXEC_TXS"),
+            &Map::<u64, ExecutedTxMeta>::new(&env),
+        );
 
         env.storage()
             .instance()
@@ -753,13 +807,22 @@ impl FamilyWallet {
                     .instance()
                     .set(&symbol_short!("PEND_TXS"), &pending_txs);
 
-                let mut executed_txs: Map<u64, bool> = env
+                let mut executed_txs: Map<u64, ExecutedTxMeta> = env
                     .storage()
                     .instance()
                     .get(&symbol_short!("EXEC_TXS"))
                     .unwrap_or_else(|| panic!("Executed transactions map not initialized"));
 
-                executed_txs.set(tx_id, true);
+                let executed_at = env.ledger().timestamp();
+                executed_txs.set(
+                    tx_id,
+                    ExecutedTxMeta {
+                        tx_id,
+                        tx_type: pending_tx.tx_type,
+                        proposer: pending_tx.proposer.clone(),
+                        executed_at,
+                    },
+                );
                 env.storage()
                     .instance()
                     .set(&symbol_short!("EXEC_TXS"), &executed_txs);
@@ -787,9 +850,8 @@ impl FamilyWallet {
             panic!("Amount must be positive");
         }
 
-        // Enhanced precision and rollover validation
-        if let Err(error) = Self::validate_precision_spending(env.clone(), proposer.clone(), amount) {
-            panic_with_error!(&env, error);
+        if !Self::check_spending_limit(env.clone(), proposer.clone(), amount) {
+            panic!("Spending limit exceeded");
         }
 
         let config: MultiSigConfig = env
@@ -1123,6 +1185,20 @@ impl FamilyWallet {
         }
     }
 
+    /// Moves **eligible** multisig-executed transactions from `EXEC_TXS` into `ARCH_TX`.
+    ///
+    /// # Semantics
+    /// - `before_timestamp` is a **retention cutoff** (ledger seconds): a row is archived iff
+    ///   `executed_at < before_timestamp`.
+    /// - The cutoff must satisfy `before_timestamp <= ledger timestamp`. A future cutoff would
+    ///   treat recent executions as “old” relative to an incorrect clock and could archive too much.
+    ///
+    /// # Authorization
+    /// Owner or Admin only (`caller.require_auth()`).
+    ///
+    /// # Data integrity
+    /// Archived rows copy **proposer**, **tx_type**, and **executed_at** from `ExecutedTxMeta`.
+    /// If `meta.tx_id != map_key`, the contract panics to avoid corrupting the archive.
     pub fn archive_old_transactions(env: Env, caller: Address, before_timestamp: u64) -> u32 {
         caller.require_auth();
         Self::require_not_paused(&env);
@@ -1133,7 +1209,12 @@ impl FamilyWallet {
 
         Self::extend_instance_ttl(&env);
 
-        let executed_txs: Map<u64, bool> = env
+        let now = env.ledger().timestamp();
+        if before_timestamp > now {
+            panic!("Archive retention cutoff must not exceed ledger time");
+        }
+
+        let mut executed_txs: Map<u64, ExecutedTxMeta> = env
             .storage()
             .instance()
             .get(&symbol_short!("EXEC_TXS"))
@@ -1147,24 +1228,35 @@ impl FamilyWallet {
 
         let current_time = env.ledger().timestamp();
         let mut archived_count = 0u32;
+        let mut to_remove: Vec<u64> = Vec::new(&env);
 
-        for (tx_id, _) in executed_txs.iter() {
-            let archived_tx = ArchivedTransaction {
-                tx_id,
-                tx_type: TransactionType::RegularWithdrawal,
-                proposer: caller.clone(),
-                executed_at: before_timestamp,
-                archived_at: current_time,
-            };
-            archived.set(tx_id, archived_tx);
-            archived_count += 1;
+        for (tx_id, meta) in executed_txs.iter() {
+            if meta.tx_id != tx_id {
+                panic!("Inconsistent executed transaction metadata");
+            }
+            if meta.executed_at < before_timestamp {
+                let archived_tx = ArchivedTransaction {
+                    tx_id: meta.tx_id,
+                    tx_type: meta.tx_type,
+                    proposer: meta.proposer.clone(),
+                    executed_at: meta.executed_at,
+                    archived_at: current_time,
+                };
+                archived.set(tx_id, archived_tx);
+                to_remove.push_back(tx_id);
+                archived_count += 1;
+            }
         }
 
-        if archived_count > 0 {
-            env.storage()
-                .instance()
-                .set(&symbol_short!("EXEC_TXS"), &Map::<u64, bool>::new(&env));
+        for i in 0..to_remove.len() {
+            if let Some(id) = to_remove.get(i) {
+                executed_txs.remove(id);
+            }
         }
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("EXEC_TXS"), &executed_txs);
 
         env.storage()
             .instance()
@@ -1184,7 +1276,21 @@ impl FamilyWallet {
         archived_count
     }
 
-    pub fn get_archived_transactions(env: Env, limit: u32) -> Vec<ArchivedTransaction> {
+    /// Returns up to `limit` archived transactions (order follows map iteration).
+    ///
+    /// # Authorization
+    /// Only Owner or Admin. Requires `caller.require_auth()` to prevent unauthenticated reads
+    /// of historical transaction metadata (ownership / privacy leakage).
+    pub fn get_archived_transactions(
+        env: Env,
+        caller: Address,
+        limit: u32,
+    ) -> Vec<ArchivedTransaction> {
+        caller.require_auth();
+        if !Self::is_owner_or_admin(&env, &caller) {
+            panic!("Only Owner or Admin can view archived transactions");
+        }
+
         let archived: Map<u64, ArchivedTransaction> = env
             .storage()
             .instance()
@@ -1201,6 +1307,13 @@ impl FamilyWallet {
         result
     }
 
+    /// Removes pending proposals whose `expires_at` is strictly before the ledger time.
+    ///
+    /// # Authorization
+    /// Owner or Admin only.
+    ///
+    /// # Integrity
+    /// Aborts if `pending.tx_id` does not match the map key (prevents silent corruption during cleanup).
     pub fn cleanup_expired_pending(env: Env, caller: Address) -> u32 {
         caller.require_auth();
         Self::require_not_paused(&env);
@@ -1222,6 +1335,9 @@ impl FamilyWallet {
         let mut to_remove: Vec<u64> = Vec::new(&env);
 
         for (tx_id, tx) in pending_txs.iter() {
+            if tx.tx_id != tx_id {
+                panic!("Inconsistent pending transaction data");
+            }
             if tx.expires_at < current_time {
                 to_remove.push_back(tx_id);
                 removed_count += 1;
@@ -1244,7 +1360,7 @@ impl FamilyWallet {
             &env,
             EventCategory::System,
             EventPriority::Low,
-            symbol_short!("archived"),
+            symbol_short!("exp_cln"),
             (removed_count, caller),
         );
         removed_count
@@ -1722,7 +1838,7 @@ impl FamilyWallet {
             EventCategory::Access,
             EventPriority::Medium,
             symbol_short!("batch_mem"),
-            members.len() as u32,
+            members.len(),
         );
         Self::require_role_at_least(&env, &caller, FamilyRole::Admin);
         Self::require_not_paused(&env);
@@ -1894,7 +2010,9 @@ impl FamilyWallet {
             false,
         );
 
-        let store_ts = env.ledger().timestamp();
+        // Avoid storing 0: `get_last_emergency_at` treats 0 as "none", and cooldown logic uses `last_ts != 0`.
+        let ts = env.ledger().timestamp();
+        let store_ts: u64 = if ts == 0 { 1u64 } else { ts };
         env.storage()
             .instance()
             .set(&symbol_short!("EM_LAST"), &store_ts);

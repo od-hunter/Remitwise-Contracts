@@ -6,7 +6,7 @@ use super::*;
 use soroban_sdk::testutils::storage::Instance as _;
 use soroban_sdk::{
     testutils::{Address as AddressTrait, Events, Ledger, LedgerInfo},
-    Address, Env, IntoVal, String, Symbol, TryFromVal, Vec as SorobanVec,
+    symbol_short, Address, Env, IntoVal, String, Symbol, TryFromVal, Vec as SorobanVec,
 };
 
 use testutils::set_ledger_time;
@@ -965,12 +965,15 @@ fn test_add_to_goal_emits_event() {
         let topics = event.1;
         let topic0: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
 
-        if topic0 == FUNDS_ADDED {
-            let event_data: FundsAddedEvent =
-                FundsAddedEvent::try_from_val(&env, &event.2).unwrap();
-            assert_eq!(event_data.goal_id, goal_id);
-            assert_eq!(event_data.amount, 1000);
-            found_added_struct = true;
+        if topic0 == symbol_short!("Remitwise") && topics.len() >= 4 {
+            let action: Symbol = Symbol::try_from_val(&env, &topics.get(3).unwrap()).unwrap();
+            if action == symbol_short!("funds_add") {
+                let event_data: FundsAddedEvent =
+                    FundsAddedEvent::try_from_val(&env, &event.2).unwrap();
+                assert_eq!(event_data.goal_id, goal_id);
+                assert_eq!(event_data.amount, 1000);
+                found_added_struct = true;
+            }
         }
 
         if topic0 == symbol_short!("savings") && topics.len() > 1 {
@@ -2525,7 +2528,7 @@ fn test_import_snapshot_appends_success_audit_entry() {
     client.import_snapshot(&owner, &0, &snapshot);
 
     let log = client.get_audit_log(&0, &10);
-    assert!(log.len() > 0, "audit log must not be empty after import");
+    assert!(!log.is_empty(), "audit log must not be empty after import");
 
     // The last entry must record a successful import.
     let last = log.get(log.len() - 1).expect("audit log must have entries");
@@ -2554,7 +2557,7 @@ fn test_import_snapshot_failed_checksum_appends_failure_audit_entry() {
     let _ = client.try_import_snapshot(&owner, &0, &snapshot);
 
     let log = client.get_audit_log(&0, &10);
-    assert!(log.len() > 0, "audit log must not be empty after failed import");
+    assert!(!log.is_empty(), "audit log must not be empty after failed import");
 
     let last = log.get(log.len() - 1).expect("audit log must have entries");
     assert!(!last.success, "last audit entry must record failure");
@@ -3478,7 +3481,6 @@ fn test_last_executed_set_to_current_time() {
         "last_executed must equal current_time (5000), not next_due (3000)"
     );
 }
-=======
 
 // ============================================================================
 // End-to-end migration compatibility tests — savings_goals ↔ data_migration

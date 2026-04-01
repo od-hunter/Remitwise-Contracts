@@ -208,5 +208,6 @@ pub const INSTANCE_LIFETIME_THRESHOLD: u32 = PERSISTENT_LIFETIME_THRESHOLD;
 pub const INSTANCE_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS; // 30 days
 pub const INSTANCE_LIFETIME_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS; // 7 days
 
+/// Storage TTL for archived contract data (instance/archive bumps).
 pub const ARCHIVE_BUMP_AMOUNT: u32 = 150 * DAY_IN_LEDGERS; // ~150 days
 pub const ARCHIVE_LIFETIME_THRESHOLD: u32 = DAY_IN_LEDGERS; // 1 day

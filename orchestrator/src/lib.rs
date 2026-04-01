@@ -12,7 +12,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, Address, Env, Symbol, Vec,
+    symbol_short, Address, Env, Map, Symbol, Vec,
 };
 use remitwise_common::{EventCategory, EventPriority, RemitwiseEvents};
 

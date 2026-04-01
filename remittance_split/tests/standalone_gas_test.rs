@@ -188,7 +188,7 @@ fn test_query_schedules_with_data_gas_measurement() {
         let next_due = env.ledger().timestamp() + 86400 * i;
         let interval = 2_592_000u64;
 
-        let result = client.create_remittance_schedule(&owner, &amount, &next_due, &interval);
+        let _ = client.create_remittance_schedule(&owner, &amount, &next_due, &interval);
     }
 
     // Measure query with data
@@ -376,7 +376,7 @@ fn test_input_validation_security() {
     assert_eq!(result, Err(Ok(RemittanceSplitError::InvalidDueDate)), "Past due date should be rejected");
 
     // Test valid parameters work
-    client.create_remittance_schedule(
+    let ok_id = client.create_remittance_schedule(
         &owner,
         &1000i128,
         &(env.ledger().timestamp() + 86400),
@@ -405,7 +405,6 @@ fn test_complete_schedule_lifecycle() {
     let (create_cpu, create_mem, schedule_id) = measure_gas(&env, || {
         client.create_remittance_schedule(&owner, &amount, &next_due, &interval)
     });
-    let schedule_id = schedule_id;
     println!("   Create - CPU: {}, Memory: {}", create_cpu, create_mem);
 
     // 2. Query single schedule
