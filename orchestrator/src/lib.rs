@@ -69,6 +69,7 @@ pub enum OrchestratorError {
     DuplicateContractAddress = 11,
     ContractNotConfigured = 12,
     SelfReferenceNotAllowed = 13,
+    NonceAlreadyUsed = 14,
 }
 
 #[contracttype]
@@ -263,7 +264,7 @@ impl Orchestrator {
     ) -> Result<(), OrchestratorError> {
         Self::acquire_execution_lock(&env)?;
         caller.require_auth();
-        let timestamp = env.ledger().timestamp();
+        let _timestamp = env.ledger().timestamp();
         // Address validation
         Self::validate_two_addresses(&env, &family_wallet_addr, &savings_addr).map_err(|e| {
             Self::release_execution_lock(&env);
@@ -292,7 +293,7 @@ impl Orchestrator {
         family_wallet_addr: Address,
         bills_addr: Address,
         bill_id: u32,
-        nonce: u64,
+        _nonce: u64,
     ) -> Result<(), OrchestratorError> {
         Self::acquire_execution_lock(&env)?;
         caller.require_auth();
@@ -312,7 +313,7 @@ impl Orchestrator {
         family_wallet_addr: Address,
         insurance_addr: Address,
         policy_id: u32,
-        nonce: u64,
+        _nonce: u64,
     ) -> Result<(), OrchestratorError> {
         Self::acquire_execution_lock(&env)?;
         caller.require_auth();
@@ -382,6 +383,35 @@ impl Orchestrator {
         Ok(())
     }
 
+    fn validate_two_addresses(
+        env: &Env,
+        addr1: &Address,
+        addr2: &Address,
+    ) -> Result<(), OrchestratorError> {
+        let current = env.current_contract_address();
+        if addr1 == &current || addr2 == &current {
+            return Err(OrchestratorError::SelfReferenceNotAllowed);
+        }
+        if addr1 == addr2 {
+            return Err(OrchestratorError::DuplicateContractAddress);
+        }
+        Ok(())
+    }
+
+    fn consume_nonce(
+        env: &Env,
+        caller: &Address,
+        command_type: Symbol,
+        nonce: u64,
+    ) -> Result<(), OrchestratorError> {
+        let key = (caller.clone(), command_type, nonce);
+        if env.storage().persistent().has(&key) {
+            return Err(OrchestratorError::NonceAlreadyUsed);
+        }
+        env.storage().persistent().set(&key, &true);
+        Ok(())
+    }
+
     fn emit_success_event(env: &Env, caller: &Address, total: i128, allocations: &Vec<i128>, timestamp: u64) {
         env.events().publish((symbol_short!("flow_ok"),), RemittanceFlowEvent {
             caller: caller.clone(),
@@ -418,5 +448,13 @@ impl Orchestrator {
             if let Some(e) = log.get(i) { out.push_back(e); }
         }
         out
+    }
+
+    /// Extend the TTL of instance storage
+    #[allow(dead_code)]
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 }

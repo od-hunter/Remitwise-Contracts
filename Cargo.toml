@@ -30,7 +30,6 @@ default-members = [
     "data_migration",
     "reporting",
     "orchestrator",
-
 ]
 resolver = "2"
 

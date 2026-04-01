@@ -3478,6 +3478,7 @@ fn test_last_executed_set_to_current_time() {
         "last_executed must equal current_time (5000), not next_due (3000)"
     );
 }
+=======
 
 // ============================================================================
 // End-to-end migration compatibility tests — savings_goals ↔ data_migration
@@ -4019,4 +4020,3 @@ mod migration_e2e_tests {
         }
     }
 }
-
