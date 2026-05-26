@@ -948,20 +948,20 @@ fn test_add_member_already_exists() {
     client.init(&owner, &initial_members);
 
     // Try to add member1 again (they already exist from initialization)
-    let result = client.try_add_family_member(&owner, &member1, &FamilyRole::Admin);
+    let result = client.try_add_member(&owner, &member1, &FamilyRole::Admin, &0);
     assert_eq!(result, Err(Ok(Error::MemberAlreadyExists)));
 
     // Try to add owner (they already exist and are the owner)
-    let result = client.try_add_family_member(&owner, &owner, &FamilyRole::Admin);
+    let result = client.try_add_member(&owner, &owner, &FamilyRole::Admin, &0);
     assert_eq!(result, Err(Ok(Error::MemberAlreadyExists)));
 
     // Add a new member successfully
     let new_member = Address::generate(&env);
-    let result = client.try_add_family_member(&owner, &new_member, &FamilyRole::Member);
+    let result = client.try_add_member(&owner, &new_member, &FamilyRole::Member, &0);
     assert!(result.is_ok());
 
     // Try to add the same new member again
-    let result = client.try_add_family_member(&owner, &new_member, &FamilyRole::Admin);
+    let result = client.try_add_member(&owner, &new_member, &FamilyRole::Admin, &0);
     assert_eq!(result, Err(Ok(Error::MemberAlreadyExists)));
 }
 
@@ -3036,4 +3036,250 @@ fn test_set_proposal_expiry_validation() {
     // Test expiry zero
     let result = client.try_set_proposal_expiry(&owner, &0);
     assert!(result.is_err());
+}
+
+// ============================================================================
+// Emergency Volume Cap and Daily Reset Tests (#640)
+//
+// Covers: same-day accumulation, cross-day reset, over-cap rejection,
+// exactly-at-cap, boundary timestamp, and emergency-mode-disabled path.
+// ============================================================================
+
+#[test]
+fn test_emergency_volume_same_day_accumulation() {
+    // Multiple transfers within one UTC day accumulate in EM_VOL and
+    // are all permitted as long as the running total stays <= daily_limit.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.init(&owner, &vec![&env]);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_contract.address());
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &5000_0000000);
+
+    // daily_limit = 3000 XLM, max_amount = 2000 XLM, cooldown = 0
+    client.configure_emergency(&owner, &2000_0000000, &0u64, &0, &3000_0000000);
+    client.set_emergency_mode(&owner, &true);
+
+    let day_start = 86400u64; // start of UTC day 1
+    set_ledger_time(&env, 100, day_start);
+    let recipient = Address::generate(&env);
+
+    // First transfer: 1000 XLM  (EM_VOL → 1000)
+    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &1000_0000000);
+    assert_eq!(token_client.balance(&recipient), 1000_0000000);
+
+    // Second transfer: 1500 XLM  (EM_VOL → 2500 ≤ 3000 — still allowed)
+    set_ledger_time(&env, 101, day_start + 100);
+    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &1500_0000000);
+    assert_eq!(token_client.balance(&recipient), 2500_0000000);
+}
+
+#[test]
+#[should_panic(expected = "Emergency daily limit exceeded")]
+fn test_emergency_volume_over_cap_rejected() {
+    // A transfer that would push the day's total over daily_limit is rejected.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.init(&owner, &vec![&env]);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &5000_0000000);
+
+    // daily_limit = 1500 XLM, cooldown = 0
+    client.configure_emergency(&owner, &2000_0000000, &0u64, &0, &1500_0000000);
+    client.set_emergency_mode(&owner, &true);
+
+    let day_start = 86400u64;
+    set_ledger_time(&env, 100, day_start);
+    let recipient = Address::generate(&env);
+
+    // First transfer: 1000 XLM — succeeds (EM_VOL → 1000)
+    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &1000_0000000);
+
+    // Second transfer: 600 XLM — fails (1000 + 600 = 1600 > 1500)
+    set_ledger_time(&env, 101, day_start + 100);
+    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &600_0000000);
+}
+
+#[test]
+fn test_emergency_volume_cross_day_reset() {
+    // After a transfer on day N fills most of the cap, a transfer on day N+1
+    // must start from zero — the residual volume must NOT carry over.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.init(&owner, &vec![&env]);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_contract.address());
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &10000_0000000);
+
+    // daily_limit = 2000 XLM, max_amount = 2000 XLM, cooldown = 0
+    client.configure_emergency(&owner, &2000_0000000, &0u64, &0, &2000_0000000);
+    client.set_emergency_mode(&owner, &true);
+
+    let day1_ts = 86400u64; // start of UTC day 1
+    set_ledger_time(&env, 100, day1_ts);
+    let recipient = Address::generate(&env);
+
+    // Day 1: use 1500 XLM (EM_VOL → 1500, 500 remaining)
+    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &1500_0000000);
+    assert_eq!(token_client.balance(&recipient), 1500_0000000);
+
+    // Advance to day 2 (timestamp 172800 = 86400 * 2)
+    let day2_ts = 86400u64 * 2;
+    set_ledger_time(&env, 200, day2_ts);
+
+    // Day 2: EM_VOL must reset to 0, so full 2000 XLM cap is available again
+    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &2000_0000000);
+    assert_eq!(token_client.balance(&recipient), 3500_0000000);
+}
+
+#[test]
+fn test_emergency_volume_exactly_at_cap_succeeds() {
+    // A single transfer that equals daily_limit exactly must succeed
+    // (boundary is inclusive: new_vol <= daily_limit is the invariant).
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.init(&owner, &vec![&env]);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_contract.address());
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &5000_0000000);
+
+    // daily_limit == max_amount == 2000 XLM, cooldown = 0
+    client.configure_emergency(&owner, &2000_0000000, &0u64, &0, &2000_0000000);
+    client.set_emergency_mode(&owner, &true);
+
+    set_ledger_time(&env, 100, 86400u64);
+    let recipient = Address::generate(&env);
+
+    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &2000_0000000);
+    assert_eq!(token_client.balance(&recipient), 2000_0000000);
+}
+
+#[test]
+#[should_panic(expected = "Emergency daily limit exceeded")]
+fn test_emergency_volume_one_stroop_over_cap_rejected() {
+    // After hitting exactly the cap, even a 1-stroop follow-up must be rejected.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.init(&owner, &vec![&env]);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &5000_0000000);
+
+    client.configure_emergency(&owner, &2000_0000000, &0u64, &0, &2000_0000000);
+    client.set_emergency_mode(&owner, &true);
+
+    let day_start = 86400u64;
+    set_ledger_time(&env, 100, day_start);
+    let recipient = Address::generate(&env);
+
+    // Hit the cap exactly
+    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &2000_0000000);
+
+    // One stroop over — must panic
+    set_ledger_time(&env, 101, day_start + 100);
+    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &1);
+}
+
+#[test]
+fn test_emergency_volume_boundary_timestamp_resets_counter() {
+    // A transfer at timestamp 86400 (first second of day 1) must reset EM_VOL
+    // even though the previous transfer was at 86399 (last second of day 0).
+    // This validates the integer-division boundary: 86400/86400=1 > 86399/86400=0.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.init(&owner, &vec![&env]);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_contract.address());
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &5000_0000000);
+
+    // daily_limit = 1000 XLM, cooldown = 0
+    client.configure_emergency(&owner, &1000_0000000, &0u64, &0, &1000_0000000);
+    client.set_emergency_mode(&owner, &true);
+
+    let recipient = Address::generate(&env);
+
+    // End of day 0: timestamp 86399
+    set_ledger_time(&env, 100, 86399u64);
+    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &500_0000000);
+    assert_eq!(token_client.balance(&recipient), 500_0000000);
+    // EM_VOL = 500, EM_LAST = 86399 (day 0)
+
+    // Exactly start of day 1: timestamp 86400 — EM_VOL must reset before accumulating
+    set_ledger_time(&env, 101, 86400u64);
+    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &1000_0000000);
+    // If EM_VOL did NOT reset, 500 + 1000 = 1500 > 1000 would have panicked.
+    assert_eq!(token_client.balance(&recipient), 1500_0000000);
+}
+
+#[test]
+fn test_emergency_mode_disabled_skips_volume_cap() {
+    // When EM_MODE is false, propose_emergency_transfer routes through the normal
+    // multisig proposal path. execute_emergency_transfer_now (and its volume cap)
+    // is never called, so even a tiny daily_limit must not block the proposal.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member = Address::generate(&env);
+    client.init(&owner, &vec![&env, member.clone()]);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &5000_0000000);
+
+    // Deliberately tiny daily_limit — would reject everything in EM_MODE
+    client.configure_emergency(&owner, &2000_0000000, &0u64, &0, &1_0000000);
+    // EM_MODE remains false (default)
+    assert!(!client.is_emergency_mode());
+
+    let signers = vec![&env, owner.clone(), member.clone()];
+    client.configure_multisig(&owner, &TransactionType::EmergencyTransfer, &2, &signers, &0);
+
+    let recipient = Address::generate(&env);
+    // Proposal amount far exceeds the daily_limit — must still be accepted as a pending tx
+    let tx_id = client.propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &2000_0000000,
+    );
+    assert!(tx_id > 0, "should create a pending multisig proposal");
+    assert!(client.get_pending_transaction(&tx_id).is_some());
 }

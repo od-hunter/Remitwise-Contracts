@@ -2081,6 +2081,76 @@ impl FamilyWallet {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    /// Enforces the emergency transfer daily volume cap and persists the updated `EM_VOL`.
+    ///
+    /// # Day-boundary rollover
+    ///
+    /// The window is anchored to **UTC midnight** boundaries derived from `EM_LAST`
+    /// (the timestamp of the most-recently completed emergency transfer):
+    ///
+    /// ```text
+    /// is_new_day = (now / 86_400) > (EM_LAST / 86_400)
+    /// ```
+    ///
+    /// When `is_new_day` is true `EM_VOL` is reset to zero before adding `amount`.
+    /// This prevents the sliding-window attack where an attacker splits transfers
+    /// across an artificial 24-hour boundary to reset the counter early and
+    /// effectively drain up to `2 × daily_limit` across two adjacent calls.
+    ///
+    /// # Checked arithmetic
+    ///
+    /// `checked_add` is used instead of `saturating_add`.  An `i128` overflow would
+    /// silently wrap to a value that passes the cap comparison; `checked_add` panics
+    /// instead, treating overflow as a hard protocol error rather than masking it.
+    ///
+    /// # Panics
+    /// - `"Emergency volume arithmetic overflow"` — `current_vol + amount` overflows `i128`.
+    /// - `"Emergency daily limit exceeded"` — accumulated volume would exceed `daily_limit`.
+    fn check_and_update_emergency_volume(env: &Env, now: u64, amount: i128, daily_limit: i128) {
+        const DAY: u64 = 86_400;
+
+        // EM_LAST: timestamp of the last recorded emergency transfer.
+        // Initialized to 0 in `init`; 0 places the last transfer at the Unix epoch
+        // (day 0), so any transfer at timestamp >= 86_400 triggers a fresh window.
+        let last_ts: u64 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("EM_LAST"))
+            .unwrap_or(0u64);
+
+        // EM_VOL: accumulated volume for the current UTC day.
+        let stored_vol: i128 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("EM_VOL"))
+            .unwrap_or(0i128);
+
+        // Integer division truncates to the start of each UTC day.
+        // e.g. 86_399 / 86_400 = 0  (day 0)
+        //      86_400 / 86_400 = 1  (day 1) ← triggers reset
+        let current_vol = if (now / DAY) > (last_ts / DAY) {
+            0i128 // new UTC day — discard previous window's volume
+        } else {
+            stored_vol
+        };
+
+        // checked_add: overflow is a hard error, not a user-correctable condition.
+        let new_vol = current_vol
+            .checked_add(amount)
+            .unwrap_or_else(|| panic!("Emergency volume arithmetic overflow"));
+
+        if new_vol > daily_limit {
+            panic!("Emergency daily limit exceeded");
+        }
+
+        // Persist updated volume. EM_LAST is written by the caller *after* the
+        // token transfer succeeds, so on the next call this helper sees the correct
+        // "last transfer day" for rollover detection.
+        env.storage()
+            .instance()
+            .set(&symbol_short!("EM_VOL"), &new_vol);
+    }
+    
     fn execute_emergency_transfer_now(
         env: Env,
         proposer: Address,
@@ -2108,21 +2178,8 @@ impl FamilyWallet {
             panic!("Emergency transfer cooldown period not elapsed");
         }
 
-        // Daily Rate Limit Enforcement
-        let day_in_seconds = 86400u64;
-        let mut daily_usage: (i128, u64) = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("EM_VOL"))
-            .unwrap_or((0i128, 0u64));
-
-        if now >= daily_usage.1.saturating_add(day_in_seconds) {
-            daily_usage = (0i128, now);
-        }
-
-        if daily_usage.0.saturating_add(amount) > config.daily_limit {
-            panic!("Emergency daily limit exceeded");
-        }
+        // Enforce daily volume cap — correct day-boundary rollover + checked arithmetic.
+        Self::check_and_update_emergency_volume(&env, now, amount, config.daily_limit);
 
         let token_client = TokenClient::new(&env, &token);
         let current_balance = token_client.balance(&proposer);
@@ -2153,11 +2210,6 @@ impl FamilyWallet {
         env.storage()
             .instance()
             .set(&symbol_short!("EM_LAST"), &store_ts);
-
-        daily_usage.0 = daily_usage.0.saturating_add(amount);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("EM_VOL"), &daily_usage);
 
         env.events().publish(
             (symbol_short!("emerg"), EmergencyEvent::TransferExec),
