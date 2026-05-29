@@ -88,21 +88,26 @@ fn test_distribution_completed_event() {
     );
 
     let events = env.events().all();
-    let last_event = events.last().expect("no events emitted");
-    let (_, topics, data) = last_event;
+    let last_event = events.last();
+    assert!(last_event.is_some(), "no events emitted");
 
-    assert_eq!(topics.len(), 4);
+    if let Some(event_tuple) = last_event {
+        let (_, topics, data) = event_tuple;
+        assert_eq!(topics.len(), 4);
 
-    let event: DistributionCompletedEvent = DistributionCompletedEvent::try_from_val(&env, &data)
-        .expect("failed to decode distribution event");
+        let event_result: Result<DistributionCompletedEvent, _> = DistributionCompletedEvent::try_from_val(&env, &data);
+        assert!(event_result.is_ok(), "failed to decode distribution event");
 
-    assert_eq!(event.from, owner);
-    assert_eq!(event.total_amount, total_amount);
-    assert_eq!(event.spending_amount, 400);
-    assert_eq!(event.savings_amount, 300);
-    assert_eq!(event.bills_amount, 200);
-    assert_eq!(event.insurance_amount, 100);
-    assert_eq!(event.timestamp, env.ledger().timestamp());
+        if let Ok(event) = event_result {
+            assert_eq!(event.from, owner);
+            assert_eq!(event.total_amount, total_amount);
+            assert_eq!(event.spending_amount, 400);
+            assert_eq!(event.savings_amount, 300);
+            assert_eq!(event.bills_amount, 200);
+            assert_eq!(event.insurance_amount, 100);
+            assert_eq!(event.timestamp, env.ledger().timestamp());
+        }
+    }
 }
 
 #[test]
@@ -136,10 +141,13 @@ fn test_distribution_event_topic_correctness() {
     let events = env.events().all();
     let dist_comp_event = events
         .iter()
-        .find(|event| event.1.len() == 4)
-        .expect("distribution completed event not found");
+        .find(|event| event.1.len() == 4);
 
-    assert_eq!(dist_comp_event.1.len(), 4);
+    assert!(dist_comp_event.is_some(), "distribution completed event not found");
+
+    if let Some(event) = dist_comp_event {
+        assert_eq!(event.1.len(), 4);
+    }
 }
 
 #[test]
@@ -312,12 +320,19 @@ fn test_execute_due_remittance_schedules_basic() {
     // Execute due schedules
     let executed = client.execute_due_remittance_schedules();
     assert_eq!(executed.len(), 1);
-    assert_eq!(executed.get(0).unwrap(), 1);
+    let first_executed = executed.get(0);
+    assert!(first_executed.is_some());
+    if let Some(id) = first_executed {
+        assert_eq!(id, 1);
+    }
 
     // Verify schedule is now inactive (one-off)
-    let schedule = client.get_remittance_schedule(&1).unwrap();
-    assert!(!schedule.active);
-    assert_eq!(schedule.last_executed, Some(3_500));
+    let schedule_result = client.get_remittance_schedule(&1);
+    assert!(schedule_result.is_some());
+    if let Some(schedule) = schedule_result {
+        assert!(!schedule.active);
+        assert_eq!(schedule.last_executed, Some(3_500));
+    }
 }
 
 #[test]
@@ -337,14 +352,21 @@ fn test_execute_recurring_remittance_schedule() {
     let executed = client.execute_due_remittance_schedules();
 
     assert_eq!(executed.len(), 1);
-    assert_eq!(executed.get(0).unwrap(), 1);
+    let first_executed = executed.get(0);
+    assert!(first_executed.is_some());
+    if let Some(id) = first_executed {
+        assert_eq!(id, 1);
+    }
 
     // Verify next_due was advanced by interval
-    let schedule = client.get_remittance_schedule(&1).unwrap();
-    assert!(schedule.active);
-    assert_eq!(schedule.next_due, 3_000 + 86_400);
-    assert_eq!(schedule.last_executed, Some(3_500));
-    assert_eq!(schedule.missed_count, 0);
+    let schedule_result = client.get_remittance_schedule(&1);
+    assert!(schedule_result.is_some());
+    if let Some(schedule) = schedule_result {
+        assert!(schedule.active);
+        assert_eq!(schedule.next_due, 3_000 + 86_400);
+        assert_eq!(schedule.last_executed, Some(3_500));
+        assert_eq!(schedule.missed_count, 0);
+    }
 }
 
 #[test]
@@ -366,10 +388,13 @@ fn test_execute_missed_remittance_schedules() {
     assert_eq!(executed.len(), 1);
 
     // Verify missed_count is 3 (the three intervals that were skipped)
-    let schedule = client.get_remittance_schedule(&1).unwrap();
-    assert_eq!(schedule.missed_count, 3);
-    assert!(schedule.next_due > 3_000 + 86_400 * 3);
-    assert_eq!(schedule.last_executed, Some(3_000 + 86_400 * 3 + 100));
+    let schedule_result = client.get_remittance_schedule(&1);
+    assert!(schedule_result.is_some());
+    if let Some(schedule) = schedule_result {
+        assert_eq!(schedule.missed_count, 3);
+        assert!(schedule.next_due > 3_000 + 86_400 * 3);
+        assert_eq!(schedule.last_executed, Some(3_000 + 86_400 * 3 + 100));
+    }
 }
 
 #[test]
@@ -390,16 +415,23 @@ fn test_execute_idempotent_oneshot() {
     // First execution
     let first = client.execute_due_remittance_schedules();
     assert_eq!(first.len(), 1);
-    assert_eq!(first.get(0).unwrap(), 1);
+    let first_id = first.get(0);
+    assert!(first_id.is_some());
+    if let Some(id) = first_id {
+        assert_eq!(id, 1);
+    }
 
     // Second execution at same timestamp must be idempotent (no-op)
     let second = client.execute_due_remittance_schedules();
     assert_eq!(second.len(), 0, "Second call must be a no-op");
 
     // Verify schedule remains inactive
-    let schedule = client.get_remittance_schedule(&1).unwrap();
-    assert!(!schedule.active);
-    assert_eq!(schedule.last_executed, Some(3_500));
+    let schedule_result = client.get_remittance_schedule(&1);
+    assert!(schedule_result.is_some());
+    if let Some(schedule) = schedule_result {
+        assert!(!schedule.active);
+        assert_eq!(schedule.last_executed, Some(3_500));
+    }
 }
 
 #[test]
@@ -420,15 +452,24 @@ fn test_execute_idempotent_recurring() {
     let first = client.execute_due_remittance_schedules();
     assert_eq!(first.len(), 1);
 
-    let first_next_due = client.get_remittance_schedule(&1).unwrap().next_due;
+    let schedule_result = client.get_remittance_schedule(&1);
+    assert!(schedule_result.is_some());
+    let first_next_due = if let Some(schedule) = schedule_result {
+        schedule.next_due
+    } else {
+        panic!("Schedule not found");
+    };
 
     // Second execution at same timestamp must not re-execute
     let second = client.execute_due_remittance_schedules();
     assert_eq!(second.len(), 0);
 
     // Verify next_due unchanged (idempotent advancement)
-    let schedule = client.get_remittance_schedule(&1).unwrap();
-    assert_eq!(schedule.next_due, first_next_due);
+    let schedule_result = client.get_remittance_schedule(&1);
+    assert!(schedule_result.is_some());
+    if let Some(schedule) = schedule_result {
+        assert_eq!(schedule.next_due, first_next_due);
+    }
 }
 
 #[test]
@@ -473,9 +514,12 @@ fn test_execute_skips_not_yet_due() {
     assert_eq!(executed.len(), 0);
 
     // Verify schedule unchanged
-    let schedule = client.get_remittance_schedule(&1).unwrap();
-    assert!(schedule.active);
-    assert_eq!(schedule.last_executed, None);
+    let schedule_result = client.get_remittance_schedule(&1);
+    assert!(schedule_result.is_some());
+    if let Some(schedule) = schedule_result {
+        assert!(schedule.active);
+        assert_eq!(schedule.last_executed, None);
+    }
 }
 
 #[test]
@@ -548,7 +592,8 @@ fn test_execute_paused_contract_returns_empty() {
     assert_eq!(schedule_id, Ok(1));
 
     // Pause contract
-    client.pause(&owner).unwrap();
+    let result = client.try_pause(&owner);
+    assert!(result.is_ok());
 
     set_time(&env, 3_500);
 
@@ -557,9 +602,12 @@ fn test_execute_paused_contract_returns_empty() {
     assert_eq!(executed.len(), 0);
 
     // Verify schedule was NOT executed (unchanged)
-    let schedule = client.get_remittance_schedule(&1).unwrap();
-    assert!(schedule.active);
-    assert_eq!(schedule.last_executed, None);
+    let schedule_result = client.get_remittance_schedule(&1);
+    assert!(schedule_result.is_some());
+    if let Some(schedule) = schedule_result {
+        assert!(schedule.active);
+        assert_eq!(schedule.last_executed, None);
+    }
 }
 
 #[test]
@@ -583,15 +631,354 @@ fn test_execute_mixed_due_not_due() {
 
     let executed = client.execute_due_remittance_schedules();
     assert_eq!(executed.len(), 1);
-    assert_eq!(executed.get(0).unwrap(), 1);
+    let first_executed = executed.get(0);
+    assert!(first_executed.is_some());
+    if let Some(id) = first_executed {
+        assert_eq!(id, 1);
+    }
 
     // Verify only schedule 1 is inactive
-    assert!(!client.get_remittance_schedule(&1).unwrap().active);
-    assert!(client.get_remittance_schedule(&2).unwrap().active);
+    let schedule1_result = client.get_remittance_schedule(&1);
+    assert!(schedule1_result.is_some());
+    if let Some(schedule1) = schedule1_result {
+        assert!(!schedule1.active);
+    }
+
+    let schedule2_result = client.get_remittance_schedule(&2);
+    assert!(schedule2_result.is_some());
+    if let Some(schedule2) = schedule2_result {
+        assert!(schedule2.active);
+    }
 }
 
 // Helper function to invoke execute_due_remittance_schedules via client
 // (Note: You may need to add this to the RemittanceSplitClient or call directly)
 pub fn set_time(env: &Env, timestamp: u64) {
     env.ledger().set_timestamp(timestamp);
+}
+
+// ============================================================================
+// Set Pause Admin Tests
+// ============================================================================
+
+#[test]
+fn test_set_pause_admin_by_owner() {
+    let env = Env::default();
+    let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
+
+    let new_pause_admin = Address::generate(&env);
+    
+    // Owner can set pause admin
+    let result = client.try_set_pause_admin(&owner, &new_pause_admin);
+    assert!(result.is_ok(), "Owner should be able to set pause admin");
+
+    // Verify storage mutation
+    assert_eq!(client.get_pause_admin_public(), Some(new_pause_admin.clone()));
+
+    // Verify event emission
+    let events = env.events().all();
+    let adm_xfr_event = events
+        .iter()
+        .find(|event| {
+            let topics = &event.1;
+            topics.len() == 2 && topics.get(1) == Some(&symbol_short!("adm_xfr"))
+        });
+    assert!(adm_xfr_event.is_some(), "adm_xfr event should be emitted");
+
+    if let Some(event) = adm_xfr_event {
+        let (_, _, data) = event;
+        let parse_result = data.try_into_val::<(Option<Address>, Address)>(&env);
+        assert!(parse_result.is_ok(), "Event data should be parseable as (Option<Address>, Address)");
+        if let Ok((old_admin, new_admin)) = parse_result {
+            assert_eq!(old_admin, None); // No previous pause admin
+            assert_eq!(new_admin, new_pause_admin);
+        }
+    }
+}
+
+#[test]
+fn test_set_pause_admin_unauthorized_caller() {
+    let env = Env::default();
+    let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
+
+    let unauthorized_caller = Address::generate(&env);
+    let new_pause_admin = Address::generate(&env);
+
+    // Record initial state
+    let initial_pause_admin = client.get_pause_admin_public();
+
+    // Unauthorized caller should be rejected
+    let result = client.try_set_pause_admin(&unauthorized_caller, &new_pause_admin);
+    assert_eq!(result, Err(Ok(RemittanceSplitError::Unauthorized)));
+
+    // Verify no storage mutation occurred
+    assert_eq!(client.get_pause_admin_public(), initial_pause_admin);
+}
+
+#[test]
+fn test_set_pause_admin_self_transfer() {
+    let env = Env::default();
+    let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
+
+    let pause_admin = Address::generate(&env);
+    let result = client.try_set_pause_admin(&owner, &pause_admin);
+assert!(result.is_ok());
+
+    let initial_pause_admin = client.get_pause_admin_public();
+
+    // Self-transfer should be idempotent (allowed but no change)
+    let result = client.try_set_pause_admin(&owner, &pause_admin);
+assert!(result.is_ok());
+
+    // Verify storage unchanged (idempotent)
+    assert_eq!(client.get_pause_admin_public(), initial_pause_admin);
+}
+
+#[test]
+fn test_set_pause_admin_double_transfer() {
+    let env = Env::default();
+    let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
+
+    let pause_admin1 = Address::generate(&env);
+    let pause_admin2 = Address::generate(&env);
+
+    // First transfer
+    let result = client.try_set_pause_admin(&owner, &pause_admin1);
+    assert!(result.is_ok());
+    assert_eq!(client.get_pause_admin_public(), Some(pause_admin1.clone()));
+
+    // Second transfer
+    let result = client.try_set_pause_admin(&owner, &pause_admin2);
+    assert!(result.is_ok());
+    assert_eq!(client.get_pause_admin_public(), Some(pause_admin2.clone()));
+
+    // Verify two events were emitted
+    let events = env.events().all();
+    let adm_xfr_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            let topics = &event.1;
+            topics.len() == 2 && topics.get(1) == Some(&symbol_short!("adm_xfr"))
+        })
+        .collect();
+
+    assert_eq!(adm_xfr_events.len(), 2);
+}
+
+#[test]
+fn test_set_pause_admin_when_paused() {
+    let env = Env::default();
+    let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
+
+    let pause_admin = Address::generate(&env);
+    let result = client.try_set_pause_admin(&owner, &pause_admin);
+assert!(result.is_ok());
+
+    // Pause the contract
+    let result = client.try_pause(&pause_admin);
+    assert!(result.is_ok());
+    assert!(client.is_paused());
+
+    let new_pause_admin = Address::generate(&env);
+
+    // Transfer should fail when contract is paused
+    let result = client.try_set_pause_admin(&owner, &new_pause_admin);
+    assert_eq!(result, Err(Ok(RemittanceSplitError::Unauthorized)));
+
+    // Verify no storage mutation
+    assert_eq!(client.get_pause_admin_public(), Some(pause_admin));
+}
+
+// ============================================================================
+// Set Upgrade Admin Tests
+// ============================================================================
+
+#[test]
+fn test_set_upgrade_admin_by_owner_initial() {
+    let env = Env::default();
+    let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
+
+    let new_upgrade_admin = Address::generate(&env);
+
+    // Owner can set initial upgrade admin
+    let result = client.try_set_upgrade_admin(&owner, &new_upgrade_admin);
+    assert!(result.is_ok());
+
+    // Verify storage mutation
+    assert_eq!(client.get_upgrade_admin_public(), Some(new_upgrade_admin.clone()));
+
+    // Verify event emission
+    let events = env.events().all();
+    let adm_xfr_event = events
+        .iter()
+        .find(|event| {
+            let topics = &event.1;
+            topics.len() == 2 && topics.get(1) == Some(&symbol_short!("adm_xfr"))
+        })
+        ;
+    assert!(adm_xfr_event.is_some(), "adm_xfr event should be emitted");
+
+    if let Some(event) = adm_xfr_event {
+        let (_, _, data) = event;
+        let parse_result = data.try_into_val::<(Option<Address>, Address)>(&env);
+        assert!(parse_result.is_ok(), "Event data should be parseable");
+        if let Ok((old_admin, new_admin)) = parse_result {
+            assert_eq!(old_admin, None); // No previous upgrade admin
+            assert_eq!(new_admin, new_upgrade_admin);
+        }
+    }
+}
+
+#[test]
+fn test_set_upgrade_admin_by_current_admin() {
+    let env = Env::default();
+    let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
+
+    let upgrade_admin1 = Address::generate(&env);
+    let result = client.try_set_upgrade_admin(&owner, &upgrade_admin1);
+    assert!(result.is_ok());
+
+    let upgrade_admin2 = Address::generate(&env);
+
+    // Current admin can transfer to new admin
+    let result = client.try_set_upgrade_admin(&upgrade_admin1, &upgrade_admin2);
+    assert!(result.is_ok());
+
+    // Verify storage mutation
+    assert_eq!(client.get_upgrade_admin_public(), Some(upgrade_admin2.clone()));
+
+    // Verify event emission
+    let events = env.events().all();
+    let adm_xfr_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            let topics = &event.1;
+            topics.len() == 2 && topics.get(1) == Some(&symbol_short!("adm_xfr"))
+        })
+        .collect();
+
+    assert_eq!(adm_xfr_events.len(), 2);
+
+    // Check the second event (transfer from admin1 to admin2)
+    let (_, _, data) = &adm_xfr_events[1];
+    let parse_result = data.try_into_val::<(Option<Address>, Address)>(&env);
+    assert!(parse_result.is_ok(), "Event data should be parseable");
+    if let Ok((old_admin, new_admin)) = parse_result {
+        assert_eq!(old_admin, Some(upgrade_admin1));
+        assert_eq!(new_admin, upgrade_admin2);
+    }
+}
+
+#[test]
+fn test_set_upgrade_admin_unauthorized_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
+
+    // Test 1: Unauthorized caller when no admin is set
+    let unauthorized_caller = Address::generate(&env);
+    let new_upgrade_admin = Address::generate(&env);
+
+    let result = client.try_set_upgrade_admin(&unauthorized_caller, &new_upgrade_admin);
+    assert_eq!(result, Err(Ok(RemittanceSplitError::Unauthorized)));
+    assert_eq!(client.get_upgrade_admin_public(), None);
+
+    // Test 2: Set an admin first
+    let upgrade_admin = Address::generate(&env);
+    let result = client.try_set_upgrade_admin(&owner, &upgrade_admin);
+assert!(result.is_ok());
+
+    // Test 3: Unauthorized caller when admin is set
+    let result = client.try_set_upgrade_admin(&unauthorized_caller, &new_upgrade_admin);
+    assert_eq!(result, Err(Ok(RemittanceSplitError::Unauthorized)));
+    assert_eq!(client.get_upgrade_admin_public(), Some(upgrade_admin));
+}
+
+#[test]
+fn test_set_upgrade_admin_self_transfer() {
+    let env = Env::default();
+    let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
+
+    let upgrade_admin = Address::generate(&env);
+    let result = client.try_set_upgrade_admin(&owner, &upgrade_admin);
+assert!(result.is_ok());
+
+    let initial_upgrade_admin = client.get_upgrade_admin_public();
+
+    // Self-transfer should be idempotent (allowed but no change)
+    let result = client.try_set_upgrade_admin(&upgrade_admin, &upgrade_admin);
+    assert!(result.is_ok());
+
+    // Verify storage unchanged (idempotent)
+    assert_eq!(client.get_upgrade_admin_public(), initial_upgrade_admin);
+}
+
+#[test]
+fn test_set_upgrade_admin_double_transfer() {
+    let env = Env::default();
+    let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
+
+    let upgrade_admin1 = Address::generate(&env);
+    let upgrade_admin2 = Address::generate(&env);
+
+    // First transfer by owner
+    let result = client.try_set_upgrade_admin(&owner, &upgrade_admin1);
+    assert!(result.is_ok());
+    assert_eq!(client.get_upgrade_admin_public(), Some(upgrade_admin1.clone()));
+
+    // Second transfer by admin1
+    let result = client.try_set_upgrade_admin(&upgrade_admin1, &upgrade_admin2);
+    assert!(result.is_ok());
+    assert_eq!(client.get_upgrade_admin_public(), Some(upgrade_admin2));
+
+    // Verify two admin transfer events were emitted
+    let events = env.events().all();
+    let adm_xfr_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            let topics = &event.1;
+            topics.len() == 2 && topics.get(1) == Some(&symbol_short!("adm_xfr"))
+        })
+        .collect();
+
+    assert_eq!(adm_xfr_events.len(), 2);
+
+    // Check the first event (transfer from owner to admin1)
+    let (_, _, data) = &adm_xfr_events[0];
+    let parse_result = data.try_into_val::<(Option<Address>, Address)>(&env);
+    assert!(parse_result.is_ok(), "Event data should be parseable");
+    if let Ok((old_admin, new_admin)) = parse_result {
+        assert_eq!(old_admin, None); // No previous upgrade admin
+        assert_eq!(new_admin, upgrade_admin1);
+    }
+
+    // Check the second event (transfer from admin1 to admin2)
+    let (_, _, data) = &adm_xfr_events[1];
+    let parse_result = data.try_into_val::<(Option<Address>, Address)>(&env);
+    assert!(parse_result.is_ok(), "Event data should be parseable");
+    if let Ok((old_admin, new_admin)) = parse_result {
+        assert_eq!(old_admin, Some(upgrade_admin1));
+        assert_eq!(new_admin, upgrade_admin2);
+    }
+}
+
+#[test]
+fn test_set_upgrade_admin_owner_cannot_override_after_initial_set() {
+    let env = Env::default();
+    let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
+
+    let upgrade_admin1 = Address::generate(&env);
+    let upgrade_admin2 = Address::generate(&env);
+
+    // Owner sets initial admin
+    let result = client.try_set_upgrade_admin(&owner, &upgrade_admin1);
+    assert!(result.is_ok());
+    assert_eq!(client.get_upgrade_admin_public(), Some(upgrade_admin1.clone()));
+
+    // Owner should NOT be able to override once admin is set
+    let result = client.try_set_upgrade_admin(&owner, &upgrade_admin2);
+    assert_eq!(result, Err(Ok(RemittanceSplitError::Unauthorized)));
+
+    // Verify no storage mutation
+    assert_eq!(client.get_upgrade_admin_public(), Some(upgrade_admin1));
 }

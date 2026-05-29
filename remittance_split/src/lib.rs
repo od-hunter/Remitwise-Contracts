@@ -375,6 +375,7 @@ impl RemittanceSplit {
     }
 
     /// Set the pause administrator responsible for emergency pause control.
+    /// This function can only be called by the contract owner. It transfers the pause admin role to a new address and emits an admin transfer event for audit trail.
     ///
     /// # Arguments
     /// * `caller` - Split owner address (must authorize)
@@ -383,6 +384,9 @@ impl RemittanceSplit {
     /// # Errors
     /// - `NotInitialized` if the split has not been initialized yet
     /// - `Unauthorized` if `caller` is not the owner or the contract is currently paused
+    ///
+    /// # Events
+    /// Emits `adm_xfr` event with (old_admin, new_admin) tuple for audit trail
     pub fn set_pause_admin(
         env: Env,
         caller: Address,
@@ -398,9 +402,15 @@ impl RemittanceSplit {
         if config.owner != caller {
             return Err(RemittanceSplitError::Unauthorized);
         }
+        let current_pause_admin = Self::get_pause_admin(&env);
         env.storage()
             .instance()
             .set(&symbol_short!("PAUSE_ADM"), &new_admin);
+        // Emit admin transfer event for audit trail
+        env.events().publish(
+            (symbol_short!("split"), symbol_short!("adm_xfr")),
+            (current_pause_admin.clone(), new_admin.clone()),
+        );
         Ok(())
     }
 
@@ -484,6 +494,11 @@ impl RemittanceSplit {
     }
     /// Set or transfer the upgrade admin role.
     ///
+    /// This function handles upgrade admin role assignment and transfers. If no upgrade admin
+    /// exists, only the contract owner can set the initial admin. If an upgrade admin exists,
+    /// only the current upgrade admin can transfer to a new admin. Emits an admin transfer event
+    /// for audit trail.
+    ///
     /// # Security Requirements
     /// - If no upgrade admin exists, only the contract owner can set the initial admin
     /// - If upgrade admin exists, only the current upgrade admin can transfer to a new admin
@@ -497,6 +512,9 @@ impl RemittanceSplit {
     /// - `Ok(())` on successful admin transfer
     /// - `Err(RemittanceSplitError::Unauthorized)` if caller lacks permission
     /// - `Err(RemittanceSplitError::NotInitialized)` if contract not initialized
+    ///
+    /// # Events
+    /// Emits `adm_xfr` event with (old_admin, new_admin) tuple for audit trail
     pub fn set_upgrade_admin(
         env: Env,
         caller: Address,
@@ -549,6 +567,15 @@ impl RemittanceSplit {
     /// - `None` if no upgrade admin has been configured
     pub fn get_upgrade_admin_public(env: Env) -> Option<Address> {
         Self::get_upgrade_admin(&env)
+    }
+
+    /// Get the current pause admin address.
+    ///
+    /// # Returns
+    /// - `Some(Address)` if pause admin is set
+    /// - `None` if no pause admin has been configured (owner is default)
+    pub fn get_pause_admin_public(env: Env) -> Option<Address> {
+        Self::get_pause_admin(&env)
     }
 
     /// Update the contract version marker used for migrations and upgrade coordination.
