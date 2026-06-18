@@ -77,6 +77,7 @@ const STORAGE_UNPAID_TOTALS: Symbol = symbol_short!("UNPD_TOT");
 const STORAGE_EXT_REF_IDX: Symbol = symbol_short!("EXTRIDX");
 const STORAGE_OWNER_INDEX: Symbol = symbol_short!("OWN_IDX");
 const STORAGE_ARCH_INDEX: Symbol = symbol_short!("ARCH_IDX");
+const STORAGE_CURRENCY_INDEX: Symbol = symbol_short!("CUR_IDX");
 const ARCH_IDX_KEY: Symbol = STORAGE_ARCH_INDEX;
 
 #[contracterror]
@@ -356,6 +357,104 @@ impl BillPayments {
         }
         idx.set(owner.clone(), new_ids);
         env.storage().instance().set(&STORAGE_ARCH_INDEX, &idx);
+    }
+
+    // -----------------------------------------------------------------------
+    // Currency-index helpers
+    // -----------------------------------------------------------------------
+
+    /// Load the currency index: Map<(Address, String), Vec<u32>>
+    /// Maps (owner, currency) pairs to their bill IDs in ascending order
+    fn get_currency_index(env: &Env) -> Map<(Address, String), Vec<u32>> {
+        env.storage()
+            .instance()
+            .get(&STORAGE_CURRENCY_INDEX)
+            .unwrap_or_else(|| Map::new(env))
+    }
+
+    fn save_currency_index(env: &Env, idx: &Map<(Address, String), Vec<u32>>) {
+        env.storage().instance().set(&STORAGE_CURRENCY_INDEX, idx);
+    }
+
+    /// Get bill IDs for a specific owner and currency
+    fn get_bills_by_owner_currency(env: &Env, owner: &Address, currency: &String) -> Vec<u32> {
+        let idx = Self::get_currency_index(env);
+        idx.get((owner.clone(), currency.clone())).unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Add a bill ID to the currency index for (owner, currency)
+    fn index_add_currency(env: &Env, owner: &Address, currency: &String, bill_id: u32) {
+        let mut idx = Self::get_currency_index(env);
+        let key = (owner.clone(), currency.clone());
+        let mut ids = idx.get(key.clone()).unwrap_or_else(|| Vec::new(env));
+        
+        // Insert in ascending order
+        let mut new_ids: Vec<u32> = Vec::new(env);
+        let mut inserted = false;
+        for id in ids.iter() {
+            if !inserted {
+                if bill_id == id {
+                    inserted = true;
+                } else if bill_id < id {
+                    new_ids.push_back(bill_id);
+                    inserted = true;
+                }
+            }
+            new_ids.push_back(id);
+        }
+        if !inserted {
+            new_ids.push_back(bill_id);
+        }
+        
+        idx.set(key, new_ids);
+        Self::save_currency_index(env, &idx);
+    }
+
+    /// Remove a bill ID from the currency index for (owner, currency)
+    fn index_remove_currency(env: &Env, owner: &Address, currency: &String, bill_id: u32) {
+        let mut idx = Self::get_currency_index(env);
+        let key = (owner.clone(), currency.clone());
+        if let Some(ids) = idx.get(key.clone()) {
+            let mut new_ids: Vec<u32> = Vec::new(env);
+            for id in ids.iter() {
+                if id != bill_id {
+                    new_ids.push_back(id);
+                }
+            }
+            if new_ids.is_empty() {
+                idx.remove(key);
+            } else {
+                idx.set(key, new_ids);
+            }
+            Self::save_currency_index(env, &idx);
+        }
+    }
+
+    /// Remove multiple bill IDs from the currency index for (owner, currency)
+    fn index_remove_currency_batch(env: &Env, owner: &Address, currency: &String, bill_ids: &Vec<u32>) {
+        let mut idx = Self::get_currency_index(env);
+        let key = (owner.clone(), currency.clone());
+        if let Some(ids) = idx.get(key.clone()) {
+            let mut new_ids: Vec<u32> = Vec::new(env);
+            for id in ids.iter() {
+                let mut removed = false;
+                for b_id in bill_ids.iter() {
+                    if id == b_id {
+                        removed = true;
+                        break;
+                    }
+                }
+                if !removed {
+                    new_ids.push_back(id);
+                }
+            }
+            if new_ids.is_empty() {
+                idx.remove(key);
+            } else {
+                idx.set(key, new_ids);
+            }
+            Self::save_currency_index(env, &idx);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -929,6 +1028,7 @@ impl BillPayments {
         };
 
         let bill_owner = bill.owner.clone();
+        let bill_currency = bill.currency.clone();
         let bill_ext_ref = bill.external_ref.clone();
         bills.set(next_id, bill);
         env.storage()
@@ -939,6 +1039,8 @@ impl BillPayments {
             .set(&symbol_short!("NEXT_ID"), &next_id);
         // Update owner index
         Self::index_add_active(&env, &bill_owner, next_id);
+        // Update currency index
+        Self::index_add_currency(&env, &bill_owner, &bill_currency, next_id);
         Self::adjust_unpaid_total(&env, &bill_owner, amount);
 
         // Emit event for audit trail
@@ -1046,6 +1148,8 @@ impl BillPayments {
                 .set(&symbol_short!("NEXT_ID"), &next_id);
             // Update owner index for the newly created recurring bill
             Self::index_add_active(&env, &caller, next_id);
+            // Update currency index for the newly created recurring bill
+            Self::index_add_currency(&env, &caller, &bill.currency, next_id);
         }
 
         let paid_amount = bill.amount;
@@ -1684,6 +1788,7 @@ impl BillPayments {
         }
 
         let removed_unpaid_amount = if bill.paid { 0 } else { bill.amount };
+        let bill_currency = bill.currency.clone();
         bills.remove(bill_id);
         env.storage()
             .instance()
@@ -1693,6 +1798,8 @@ impl BillPayments {
         }
         // Remove from owner index
         Self::index_remove_active(&env, &caller, bill_id);
+        // Remove from currency index
+        Self::index_remove_currency(&env, &caller, &bill_currency, bill_id);
         RemitwiseEvents::emit(
             &env,
             EventCategory::State,
@@ -1735,6 +1842,7 @@ impl BillPayments {
         let mut archived_count = 0u32;
         let mut to_remove: Vec<u32> = Vec::new(&env);
         let mut owner_to_archived: Map<Address, Vec<u32>> = Map::new(&env);
+        let mut owner_currency_to_removed: Map<(Address, String), Vec<u32>> = Map::new(&env);
 
         for (id, bill) in bills.iter() {
             if let Some(paid_at) = bill.paid_at {
@@ -1763,6 +1871,14 @@ impl BillPayments {
                     list.push_back(id);
                     owner_to_archived.set(bill.owner.clone(), list);
 
+                    // Track currency for index removal
+                    let currency_key = (bill.owner.clone(), bill.currency.clone());
+                    let mut currency_list = owner_currency_to_removed
+                        .get(currency_key.clone())
+                        .unwrap_or_else(|| Vec::new(&env));
+                    currency_list.push_back(id);
+                    owner_currency_to_removed.set(currency_key, currency_list);
+
                     to_remove.push_back(id);
                     archived_count += 1;
                 }
@@ -1784,6 +1900,11 @@ impl BillPayments {
         for (owner, ids) in owner_to_archived.iter() {
             Self::index_remove_active_batch(&env, &owner, &ids);
             Self::index_add_archived_batch(&env, &owner, &ids);
+        }
+
+        // Update currency indexes in batch per (owner, currency)
+        for ((owner, currency), ids) in owner_currency_to_removed.iter() {
+            Self::index_remove_currency_batch(&env, &owner, &currency, &ids);
         }
 
         Self::extend_archive_ttl(&env);
@@ -1849,6 +1970,8 @@ impl BillPayments {
 
         Self::index_remove_archived(&env, &caller, bill_id);
         Self::index_add_active(&env, &caller, bill_id);
+        // Add back to currency index
+        Self::index_add_currency(&env, &caller, &archived_bill.currency, bill_id);
 
         env.storage()
             .instance()
@@ -1998,6 +2121,8 @@ impl BillPayments {
                 bills.set(next_id, next_bill);
                 // Update owner index for the newly spawned recurring bill
                 Self::index_add_active(&env, &caller, next_id);
+                // Update currency index for the newly spawned recurring bill
+                Self::index_add_currency(&env, &caller, &bill.currency, next_id);
             } else {
                 unpaid_delta = unpaid_delta.saturating_sub(amount);
             }
@@ -2119,20 +2244,17 @@ impl BillPayments {
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        // Use the owner index for O(owner_bills) traversal instead of O(NEXT_ID).
-        let owner_ids = Self::get_owner_bills(&env, &owner);
+        // Use the currency index for O(owner_currency_bills) traversal instead of O(owner_bills).
+        let currency_ids = Self::get_bills_by_owner_currency(&env, &owner, &normalized_currency);
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for id in owner_ids.iter() {
+        for id in currency_ids.iter() {
             if id <= cursor {
                 continue;
             }
             let Some(bill) = bills.get(id) else {
                 continue;
             };
-            if bill.currency != normalized_currency {
-                continue;
-            }
             staging.push_back((id, bill));
             if staging.len() > limit {
                 break;
@@ -2182,20 +2304,18 @@ impl BillPayments {
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let normalized_currency = Self::normalize_currency(&env, &currency);
-
-        // Use the owner index for O(owner_bills) traversal instead of O(NEXT_ID).
-        let owner_ids = Self::get_owner_bills(&env, &owner);
+        // Use the currency index for O(owner_currency_bills) traversal instead of O(owner_bills).
+        let currency_ids = Self::get_bills_by_owner_currency(&env, &owner, &normalized_currency);
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for id in owner_ids.iter() {
+        for id in currency_ids.iter() {
             if id <= cursor {
                 continue;
             }
             let Some(bill) = bills.get(id) else {
                 continue;
             };
-            if bill.paid || bill.currency != normalized_currency {
+            if bill.paid {
                 continue;
             }
             staging.push_back((id, bill));
