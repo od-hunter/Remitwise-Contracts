@@ -3,9 +3,24 @@ use soroban_sdk::testutils::storage::Instance as _;
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
     token::{StellarAssetClient, TokenClient},
-    vec, Env,
+    vec, Env, InvokeError,
 };
 use testutils::set_ledger_time;
+
+/// Functions like `propose_emergency_transfer` return a bare `u64` and signal
+/// failure via `panic_with_error!`, rather than declaring `Result<_, Error>`.
+/// Their generated `try_*` client method therefore surfaces the contract
+/// `Error` as a host-level `soroban_sdk::Error` nested in the *outer* `Err`
+/// (`Err(Ok(soroban_sdk::Error))`), not as `Err(Ok(crate::Error))` the way a
+/// `Result`-returning function like `configure_multisig` would. This helper
+/// builds the exact expected shape from our typed `Error` enum so tests don't
+/// have to repeat the conversion (and so a future error-type change in this
+/// path is caught by every call site at once).
+fn emergency_error<T>(
+    err: Error,
+) -> Result<Result<T, soroban_sdk::Error>, Result<soroban_sdk::Error, InvokeError>> {
+    Err(Ok(soroban_sdk::Error::from(err)))
+}
 
 #[test]
 fn test_initialize_wallet_succeeds() {
@@ -976,7 +991,6 @@ fn test_emergency_transfer_cooldown_enforced() {
 }
 
 #[test]
-#[should_panic(expected = "Emergency transfer would violate minimum balance requirement")]
 fn test_emergency_transfer_min_balance_enforced() {
     let env = Env::default();
     env.mock_all_auths();
@@ -990,6 +1004,326 @@ fn test_emergency_transfer_min_balance_enforced() {
 
     let token_admin = Address::generate(&env);
     let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_contract.address());
+
+    let total = 3000_0000000;
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &total);
+
+    // min_balance = 2500: a transfer of 1000 would leave 2000, breaching the floor.
+    client.configure_emergency(&owner, &2000_0000000, &0u64, &2500_0000000, &5000_0000000);
+    client.set_emergency_mode(&owner, &true);
+
+    let recipient = Address::generate(&env);
+    let result = client.try_propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &1000_0000000,
+    );
+
+    assert_eq!(result, emergency_error(Error::MinBalanceViolation));
+    // Rejected transfer must not move any funds.
+    assert_eq!(token_client.balance(&owner), total);
+    assert_eq!(token_client.balance(&recipient), 0);
+}
+
+/// A transfer that leaves the balance exactly at `min_balance` must succeed —
+/// the floor is an inclusive lower bound, not an exclusive one.
+#[test]
+fn test_emergency_transfer_min_balance_boundary_exact_floor_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = vec![&env];
+    client.init(&owner, &initial_members);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_contract.address());
+
+    let total = 3000_0000000;
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &total);
+
+    let min_balance = 2000_0000000;
+    let amount = total - min_balance; // post-transfer balance lands exactly on the floor
+    client.configure_emergency(&owner, &2000_0000000, &0u64, &min_balance, &5000_0000000);
+    client.set_emergency_mode(&owner, &true);
+
+    let recipient = Address::generate(&env);
+    let result =
+        client.try_propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &amount);
+
+    assert!(result.is_ok());
+    assert_eq!(token_client.balance(&owner), min_balance);
+    assert_eq!(token_client.balance(&recipient), amount);
+}
+
+/// One stroop past the floor (post-transfer balance = min_balance - 1) must be rejected.
+#[test]
+fn test_emergency_transfer_min_balance_boundary_one_stroop_under_floor_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = vec![&env];
+    client.init(&owner, &initial_members);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_contract.address());
+
+    let total = 3000_0000000;
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &total);
+
+    let min_balance = 2000_0000000;
+    let amount = total - min_balance + 1; // one stroop past the floor
+    client.configure_emergency(&owner, &2000_0000000, &0u64, &min_balance, &5000_0000000);
+    client.set_emergency_mode(&owner, &true);
+
+    let recipient = Address::generate(&env);
+    let result =
+        client.try_propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &amount);
+
+    assert_eq!(result, emergency_error(Error::MinBalanceViolation));
+    assert_eq!(token_client.balance(&owner), total);
+}
+
+/// `min_balance = 0` disables the floor entirely: a transfer draining the wallet
+/// to zero must succeed, since any non-negative post-transfer balance clears it.
+#[test]
+fn test_emergency_transfer_zero_min_balance_disables_floor() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = vec![&env];
+    client.init(&owner, &initial_members);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_contract.address());
+
+    let total = 3000_0000000;
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &total);
+
+    client.configure_emergency(&owner, &5000_0000000, &0u64, &0, &5000_0000000);
+    client.set_emergency_mode(&owner, &true);
+
+    let recipient = Address::generate(&env);
+    // Drain the entire balance — leaves exactly 0, which satisfies `>= 0`.
+    let result =
+        client.try_propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &total);
+
+    assert!(result.is_ok());
+    assert_eq!(token_client.balance(&owner), 0);
+    assert_eq!(token_client.balance(&recipient), total);
+}
+
+/// The min_balance floor and the daily volume cap are independent checks; both
+/// must pass. This test isolates each rejection reason in turn: a transfer that
+/// only breaches the floor (cap has headroom to spare) is rejected with
+/// `MinBalanceViolation` and must not record any daily volume; a transfer that
+/// only breaches the cap (floor has headroom to spare) is rejected for the cap
+/// rather than the floor.
+#[test]
+fn test_emergency_transfer_min_balance_interacts_with_daily_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = vec![&env];
+    client.init(&owner, &initial_members);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_contract.address());
+
+    let total = 10_000_0000000;
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &total);
+    set_ledger_time(&env, 100, 1_000);
+
+    // --- Scenario A: floor rejects, daily cap has ample headroom ---------------
+    // min_balance = 9,500 → the largest single transfer respecting the floor is
+    // 500. daily_limit = 10,000 is far larger than anything tested here, so the
+    // cap can never be the binding constraint in this scenario.
+    let read_em_vol = || -> i128 {
+        env.as_contract(&contract_id, || {
+            env.storage().instance().get(&symbol_short!("EM_VOL"))
+        })
+        .unwrap_or(0i128)
+    };
+
+    client.configure_emergency(&owner, &5_000_0000000, &0u64, &9_500_0000000, &10_000_0000000);
+    client.set_emergency_mode(&owner, &true);
+    let recipient = Address::generate(&env);
+
+    // 600 leaves 9,400 < 9,500 — breaches the floor; well under the 10,000 cap.
+    let result = client.try_propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &600_0000000,
+    );
+    assert_eq!(result, emergency_error(Error::MinBalanceViolation));
+    assert_eq!(token_client.balance(&owner), total);
+    assert_eq!(
+        read_em_vol(),
+        0,
+        "a transfer rejected for the min_balance floor must not record phantom daily volume"
+    );
+
+    // 500 leaves exactly 9,500 — respects the floor (inclusive boundary) and the
+    // cap — succeeds, consuming 500 of the daily budget.
+    let result = client.try_propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &500_0000000,
+    );
+    assert!(result.is_ok());
+    assert_eq!(token_client.balance(&owner), total - 500_0000000);
+    assert_eq!(read_em_vol(), 500_0000000);
+
+    // --- Scenario B: daily cap rejects, floor has ample headroom ---------------
+    // Reconfigure with a generous floor (1,000) but a tight daily cap. The
+    // wallet currently holds total - 500 = 9,500.
+    client.configure_emergency(&owner, &5_000_0000000, &0u64, &1_000_0000000, &900_0000000);
+    // Reconfiguring resets neither EM_VOL nor EM_LAST — both persist across a
+    // `configure_emergency` call, so the cap below is evaluated against the
+    // pre-existing accumulated volume from Scenario A.
+    assert_eq!(read_em_vol(), 500_0000000);
+
+    // A transfer of 300 would leave 9,200 (miles above the new 1,000 floor) but
+    // cumulative volume would become 500 + 300 = 800 <= 900 — succeeds.
+    let result = client.try_propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &300_0000000,
+    );
+    assert!(result.is_ok());
+    assert_eq!(read_em_vol(), 800_0000000);
+
+    // A further transfer of 200 would leave plenty of balance above the floor
+    // (9,200 - 200 = 9,000 >= 1,000) but cumulative volume would become
+    // 800 + 200 = 1,000 > 900 — rejected for the daily cap, not the floor.
+    let result = client.try_propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &200_0000000,
+    );
+    assert!(result.is_err());
+    assert_ne!(
+        result,
+        emergency_error(Error::MinBalanceViolation),
+        "this rejection should come from the daily cap, not the min_balance floor"
+    );
+    assert_eq!(read_em_vol(), 800_0000000, "a cap-rejected transfer must not mutate EM_VOL");
+}
+
+/// The min_balance floor and the cooldown timer are independent checks. A
+/// transfer made before the cooldown elapses must be rejected for cooldown,
+/// not min_balance — and once the cooldown elapses, the same-sized transfer
+/// must still be subject to the floor check.
+#[test]
+fn test_emergency_transfer_min_balance_interacts_with_cooldown() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = vec![&env];
+    client.init(&owner, &initial_members);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_contract.address());
+
+    let total = 5_000_0000000;
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &total);
+    set_ledger_time(&env, 100, 1_000);
+
+    let min_balance = 4_000_0000000;
+    let cooldown = 3_600u64;
+    client.configure_emergency(&owner, &2_000_0000000, &cooldown, &min_balance, &10_000_0000000);
+    client.set_emergency_mode(&owner, &true);
+    let recipient = Address::generate(&env);
+
+    // First transfer: respects the floor (leaves 4500 >= 4000), succeeds and starts cooldown.
+    let result = client.try_propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &500_0000000,
+    );
+    assert!(result.is_ok());
+    assert_eq!(token_client.balance(&owner), total - 500_0000000);
+
+    // Second transfer, still within the cooldown window: even though this amount
+    // would also respect the floor (4500 - 400 = 4100 >= 4000), cooldown fires first.
+    let result = client.try_propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &400_0000000,
+    );
+    assert!(result.is_err());
+    assert_ne!(
+        result,
+        emergency_error(Error::MinBalanceViolation),
+        "cooldown should reject before the floor check is reached"
+    );
+    assert_eq!(token_client.balance(&owner), total - 500_0000000);
+
+    // Advance past the cooldown. Now the floor is the binding constraint: current
+    // balance is 4500; transferring 600 would leave 3900 < 4000 — rejected for floor.
+    set_ledger_time(&env, 101, 1_000 + cooldown + 1);
+    let result = client.try_propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &600_0000000,
+    );
+    assert_eq!(result, emergency_error(Error::MinBalanceViolation));
+    assert_eq!(token_client.balance(&owner), total - 500_0000000);
+
+    // A smaller transfer respecting the floor (4500 - 500 = 4000 >= 4000) succeeds.
+    let result = client.try_propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &500_0000000,
+    );
+    assert!(result.is_ok());
+    assert_eq!(token_client.balance(&owner), total - 1_000_0000000);
+}
+
+/// `EmergencyEvent::TransferExec` must be published only when the transfer
+/// actually executes — a min_balance rejection must not emit it.
+#[test]
+fn test_emergency_transfer_min_balance_rejection_emits_no_transfer_exec_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = vec![&env];
+    client.init(&owner, &initial_members);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
 
     let total = 3000_0000000;
     StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &total);
@@ -998,7 +1332,25 @@ fn test_emergency_transfer_min_balance_enforced() {
     client.set_emergency_mode(&owner, &true);
 
     let recipient = Address::generate(&env);
-    client.propose_emergency_transfer(&owner, &token_contract.address(), &recipient, &1000_0000000);
+    let result = client.try_propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &1000_0000000,
+    );
+    assert_eq!(result, emergency_error(Error::MinBalanceViolation));
+
+    // No EM_LAST should have been recorded — that's only written after a
+    // successful execution, and absence of it is an easy proxy for "no
+    // TransferExec-triggering execution happened".
+    assert!(client.get_last_emergency_at().is_none());
+
+    // The audit trail should record only the configure/mode-toggle operations,
+    // never an `em_exec` entry, since execution never reached that point.
+    let audit = client.get_access_audit(&10);
+    for entry in audit.iter() {
+        assert_ne!(entry.operation, symbol_short!("em_exec"));
+    }
 }
 
 #[test]
@@ -4614,4 +4966,3 @@ fn test_precision_spending_overflow_graceful() {
     let result = client.try_validate_precision_spending(&member, &i128::MAX);
     assert!(result.is_err());
 }
-

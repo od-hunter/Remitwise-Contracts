@@ -298,6 +298,9 @@ pub enum Error {
     InvalidProposalExpiry = 21,
     MemberAlreadyExists = 22,
     QuorumUnachievable = 23,
+    /// An emergency transfer was rejected because the resulting balance would
+    /// fall below `EmergencyConfig.min_balance`.
+    MinBalanceViolation = 24,
 }
 
 #[contractimpl]
@@ -2567,10 +2570,34 @@ impl FamilyWallet {
         // Enforce daily volume cap — correct day-boundary rollover + checked arithmetic.
         Self::check_and_update_emergency_volume(&env, now, amount, config.daily_limit);
 
+        // --- Minimum balance floor -------------------------------------------------
+        //
+        // Invariant: an emergency transfer must never drain the proposer's balance
+        // below `EmergencyConfig.min_balance`. This floor exists so a wallet stays
+        // solvent for recurring obligations (bills, premiums) even during an
+        // emergency drain; if it were unenforced it would be a purely decorative
+        // setting.
+        //
+        // `min_balance == 0` intentionally disables the floor (any non-negative
+        // post-transfer balance is allowed), matching `configure_emergency`'s
+        // validation that only rejects *negative* `min_balance` values.
+        //
+        // TOCTOU safety: this reads `current_balance` from the same `token_client`
+        // (same token address) that `execute_transaction_internal` uses to perform
+        // the actual transfer below, and no external/cross-contract call happens
+        // between this read and that transfer — so there is no window in which the
+        // balance could change between the check and the transfer.
+        //
+        // `checked_sub` (rather than plain `-`) mirrors the daily-volume cap's
+        // checked-arithmetic discipline: an overflow/underflow here must surface as
+        // a hard error rather than silently wrapping and bypassing the floor.
         let token_client = TokenClient::new(&env, &token);
         let current_balance = token_client.balance(&proposer);
-        if current_balance - amount < config.min_balance {
-            panic!("Emergency transfer would violate minimum balance requirement");
+        let post_transfer_balance = current_balance
+            .checked_sub(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::MinBalanceViolation));
+        if post_transfer_balance < config.min_balance {
+            panic_with_error!(&env, Error::MinBalanceViolation);
         }
 
         RemitwiseEvents::emit(
