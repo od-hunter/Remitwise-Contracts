@@ -14,12 +14,13 @@ members = [
     "data_migration",
     "reporting",
     "orchestrator",
+    "emergency_killswitch",
     "cli",
     "scenarios",
 
     "testutils",
-
     "integration_tests",
+    "remitwise-common",
 ]
 default-members = [
     "remittance_split",
@@ -30,12 +31,12 @@ default-members = [
     "data_migration",
     "reporting",
     "orchestrator",
-
 ]
 resolver = "2"
 
 [dependencies]
 soroban-sdk = "=21.7.7"
+ed25519-dalek = "2.1.1"
 remittance_split = { path = "./remittance_split" }
 savings_goals = { path = "./savings_goals" }
 bill_payments = { path = "./bill_payments" }
@@ -43,6 +44,7 @@ insurance = { path = "./insurance" }
 family_wallet = { path = "./family_wallet" }
 reporting = { path = "./reporting" }
 orchestrator = { path = "./orchestrator" }
+remitwise-common = { path = "./remitwise-common" }
 
 [dev-dependencies]
 soroban-sdk = { version = "=21.7.7", features = ["testutils"] }

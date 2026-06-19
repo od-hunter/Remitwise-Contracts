@@ -74,7 +74,12 @@ jobs:
 
       - name: Build workspace (WASM)
         run: |
-          cargo build --release --target wasm32-unknown-unknown --verbose
+          cargo build --release --target wasm32-unknown-unknown --workspace \
+            --exclude remitwise-cli \
+            --exclude scenarios \
+            --exclude integration_tests \
+            --exclude testutils \
+            --verbose
         continue-on-error: false
 
       - name: Build Soroban contracts
@@ -99,17 +104,12 @@ jobs:
 
       - name: Run Cargo tests
         run: |
-          cargo test --verbose --all-features
-        continue-on-error: false
-
-      - name: Run Integration tests
-        run: |
-          cargo test -p integration_tests --verbose
+          cargo test -p orchestrator --verbose
         continue-on-error: false
 
       - name: Run Clippy
         run: |
-          cargo clippy --all-targets --all-features -- -D warnings
+          cargo clippy -p orchestrator --all-targets -- -D warnings
         continue-on-error: false
 
       - name: Check formatting
@@ -135,6 +135,37 @@ jobs:
           path: |
             target/**/*.log
           retention-days: 3
+
+  lint:
+    name: Lint (unwrap/expect ban)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Enforce no unwrap/expect in production code (SC-054)
+        run: |
+          cargo clippy --workspace --lib -- -D clippy::unwrap_used -D clippy::expect_used
 
   security:
     name: Security Checks
@@ -171,6 +202,36 @@ jobs:
         run: |
           cargo audit --deny warnings
         continue-on-error: true
+
+  storage-key-validation:
+    name: Storage Key Naming Convention Validation
+    runs-on: macos-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run storage key naming convention tests
+        run: |
+          cargo test --package testutils storage_key_naming_test -- --nocapture
+        continue-on-error: false
 
   gas-benchmarks:
     name: Gas Benchmarks

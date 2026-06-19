@@ -13,6 +13,22 @@ This document describes on-chain storage keys and value shapes for every workspa
 
 Scope: current implementation in this repository, focused on auditability and migration planning.
 
+## Storage Key Naming Conventions
+
+All storage keys follow strict naming conventions to ensure consistency and compatibility with Soroban's `symbol_short!` macro:
+
+- **Maximum length:** 9 characters (enforced by `symbol_short!`)
+- **Format:** UPPERCASE_WITH_UNDERSCORES
+- **Valid characters:** A-Z, 0-9, \_ (underscore)
+
+These conventions are automatically validated in CI. See [Storage Key Naming Conventions](docs/storage-key-naming-conventions.md) for detailed guidelines and [testutils/tests/README.md](testutils/tests/README.md) for information about the automated validation tests.
+
+**Run validation tests:**
+
+```bash
+cargo test --package testutils storage_key_naming_test -- --nocapture
+```
+
 ## Common Patterns
 
 ### Storage scope
@@ -31,6 +47,18 @@ Scope: current implementation in this repository, focused on auditability and mi
 - Important implementation detail:
   - Archive bump helpers still call `instance().extend_ttl(...)`; they extend the contract instance entry TTL, not a separate archive namespace.
 
+### Shared TTL-bump helpers (remitwise-common)
+
+`remitwise-common` exports three helpers that centralise the canonical TTL policy:
+
+| Helper                      | Threshold                                 | Bump                               | Purpose                    |
+| --------------------------- | ----------------------------------------- | ---------------------------------- | -------------------------- |
+| `bump_instance(env)`        | `INSTANCE_LIFETIME_THRESHOLD` (1 day)     | `INSTANCE_BUMP_AMOUNT` (30 days)   | Active instance data       |
+| `bump_persistent(env, key)` | `PERSISTENT_LIFETIME_THRESHOLD` (15 days) | `PERSISTENT_BUMP_AMOUNT` (60 days) | Persistent storage entries |
+| `bump_archive(env)`         | `ARCHIVE_LIFETIME_THRESHOLD` (1 day)      | `ARCHIVE_BUMP_AMOUNT` (150 days)   | Archive instance window    |
+
+Using these helpers prevents the common mistake of swapping `threshold` and `bump` arguments. See [docs/ttl-bump-helpers.md](docs/ttl-bump-helpers.md) for usage guidance.
+
 ### ID allocation patterns
 
 - Monotonic counters via `NEXT_*` keys:
@@ -44,49 +72,55 @@ Scope: current implementation in this repository, focused on auditability and mi
 
 ### Keys and value types (instance storage)
 
-| Key | Type | Notes |
-|---|---|---|
-| `CONFIG` | `SplitConfig` | Owner + percentages + initialized flag |
-| `SPLIT` | `Vec<u32>` | Ordered percentages: `[spending, savings, bills, insurance]` |
-| `NONCES` | `Map<Address, u64>` | Replay protection for owner-authorized mutating calls |
-| `AUDIT` | `Vec<AuditEntry>` | Rotating audit log, max `MAX_AUDIT_ENTRIES` (100) |
-| `REM_SCH` | `Map<u32, RemittanceSchedule>` | Remittance schedules |
-| `NEXT_RSCH` | `u32` | Next remittance schedule ID |
-| `PAUSE_ADM` | `Address` | Pause admin |
-| `PAUSED` | `bool` | Global pause flag |
-| `UPG_ADM` | `Address` | Upgrade admin |
-| `VERSION` | `u32` | Contract version |
-
-### TTL and IDs
-
-- TTL bumps on mutating flows via `extend_instance_ttl`.
-- Schedule IDs allocate from `NEXT_RSCH` (`0 -> 1 -> 2 ...`).
-
-## savings_goals
-
-### Keys and value types (instance storage)
-
-| Key | Type | Notes |
-|---|---|---|
-| `GOALS` | `Map<u32, SavingsGoal>` | Primary goal records |
-| `NEXT_ID` | `u32` | Next savings goal ID |
-| `SAV_SCH` | `Map<u32, SavingsSchedule>` | Recurring savings schedules |
-| `NEXT_SSCH` | `u32` | Next savings schedule ID |
-| `NONCES` | `Map<Address, u64>` | Snapshot import nonce tracking |
-| `AUDIT` | `Vec<AuditEntry>` | Rotating audit log, max 100 |
-| `PAUSE_ADM` | `Address` | Pause admin |
-| `PAUSED` | `bool` | Global pause flag |
-| `PAUSED_FN` | `Map<Symbol, bool>` | Per-function pause switches |
-| `UNP_AT` | `u64` | Optional time-locked unpause timestamp |
-| `UPG_ADM` | `Address` | Upgrade admin |
-| `VERSION` | `u32` | Contract version |
+| Key         | Type                           | Notes                                                        |
+| ----------- | ------------------------------ | ------------------------------------------------------------ |
+| `CONFIG`    | `SplitConfig`                  | Owner + percentages + initialized flag                       |
+| `SPLIT`     | `Vec<u32>`                     | Ordered percentages: `[spending, savings, bills, insurance]` |
+| `NONCES`    | `Map<Address, u64>`            | Replay protection for owner-authorized mutating calls        |
+| `AUDIT`     | `Vec<AuditEntry>`              | Rotating audit log, max `MAX_AUDIT_ENTRIES` (100)            |
+| `REM_SCH`   | `Map<u32, RemittanceSchedule>` | Remittance schedules                                         |
+| `NEXT_RSCH` | `u32`                          | Next remittance schedule ID                                  |
+| `PAUSE_ADM` | `Address`                      | Pause admin                                                  |
+| `PAUSED`    | `bool`                         | Global pause flag                                            |
+| `UPG_ADM`   | `Address`                      | Upgrade admin                                                |
+| `VERSION`   | `u32`                          | Contract version                                             |
 
 ### Keys and value types (persistent storage)
 
-| Key | Type | Notes |
-|---|---|---|
-| `NEXT_ID` | `u32` | Initialized in `init` if absent |
-| `GOALS` | `Map<u32, SavingsGoal>` | Initialized in `init` if absent |
+| Key               | Type                 | Notes                                                     |
+| ----------------- | -------------------- | --------------------------------------------------------- |
+| `Schedule(u32)`   | `RemittanceSchedule` | Individual remittance schedule                            |
+| `OwnerSchedules`  | `Vec<u32>`           | Per-owner index of schedule IDs, ordered by ID ascending  |
+
+### TTL and IDs
+
+- **Instance TTL**: `CONFIG`, `SPLIT`, and other administrative keys are bumped on every access (read/write) using `INSTANCE_BUMP_AMOUNT` / `INSTANCE_LIFETIME_THRESHOLD`.
+- **Persistent TTL**: `RemittanceSchedule` and the `OwnerSchedules` index are bumped on every access using `PERSISTENT_BUMP_AMOUNT` / `PERSISTENT_LIFETIME_THRESHOLD`.
+- Schedule IDs allocate from `NEXT_RSCH` (`0 -> 1 -> 2 ...`).
+
+### Savings Goals Storage (Scalable DataKey Pattern)
+
+### Keys and value types (instance storage)
+
+| Key         | Type                        | Notes                                  |
+| ----------- | --------------------------- | -------------------------------------- |
+| `GOALS`     | `Map<u32, SavingsGoal>`     | Primary goal records                   |
+| `NEXT_ID`   | `u32`                       | Next savings goal ID                   |
+| `SAV_SCH`   | `Map<u32, SavingsSchedule>` | Recurring savings schedules            |
+| `NEXT_SSCH` | `u32`                       | Next savings schedule ID               |
+| `NONCES`    | `Map<Address, u64>`         | Snapshot import nonce tracking         |
+| `AUDIT`     | `Vec<AuditEntry>`           | Rotating audit log, max 100            |
+| `PAUSE_ADM` | `Address`                   | Pause admin                            |
+| `PAUSED`    | `bool`                      | Global pause flag                      |
+| `PAUSED_FN` | `Map<Symbol, bool>`         | Per-function pause switches            |
+| `UNP_AT`    | `u64`                       | Optional time-locked unpause timestamp |
+| `UPG_ADM`   | `Address`                   | Upgrade admin                          |
+| `VERSION`   | `u32`                       | Contract version                       |
+
+| Key       | Type                    | Notes                           |
+| --------- | ----------------------- | ------------------------------- |
+| `NEXT_ID` | `u32`                   | Initialized in `init` if absent |
+| `GOALS`   | `Map<u32, SavingsGoal>` | Initialized in `init` if absent |
 
 ### TTL and IDs
 
@@ -99,18 +133,19 @@ Scope: current implementation in this repository, focused on auditability and mi
 
 ### Keys and value types (instance storage)
 
-| Key | Type | Notes |
-|---|---|---|
-| `BILLS` | `Map<u32, Bill>` | Active bill records |
-| `NEXT_ID` | `u32` | Next bill ID |
-| `ARCH_BILL` | `Map<u32, ArchivedBill>` | Archived paid bills |
-| `STOR_STAT` | `StorageStats` | Aggregated storage metrics |
-| `PAUSE_ADM` | `Address` | Pause admin |
-| `PAUSED` | `bool` | Global pause flag |
-| `PAUSED_FN` | `Map<Symbol, bool>` | Per-function pause switches |
-| `UNP_AT` | `u64` | Optional unpause timestamp |
-| `UPG_ADM` | `Address` | Upgrade admin |
-| `VERSION` | `u32` | Contract version |
+| Key         | Type                     | Notes                                                                                                                        |
+| ----------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `BILLS`     | `Map<u32, Bill>`         | Active bill records                                                                                                          |
+| `NEXT_ID`   | `u32`                    | Next bill ID                                                                                                                 |
+| `ARCH_BILL` | `Map<u32, ArchivedBill>` | Archived paid bills                                                                                                          |
+| `ARCH_IDX`  | `Map<Address, Vec<u32>>` | Per-owner index of archived bill IDs (ascending order); used by `get_archived_bills_page` for O(limit) gas-bounded retrieval |
+| `STOR_STAT` | `StorageStats`           | Aggregated storage metrics                                                                                                   |
+| `PAUSE_ADM` | `Address`                | Pause admin                                                                                                                  |
+| `PAUSED`    | `bool`                   | Global pause flag                                                                                                            |
+| `PAUSED_FN` | `Map<Symbol, bool>`      | Per-function pause switches                                                                                                  |
+| `UNP_AT`    | `u64`                    | Optional unpause timestamp                                                                                                   |
+| `UPG_ADM`   | `Address`                | Upgrade admin                                                                                                                |
+| `VERSION`   | `u32`                    | Contract version                                                                                                             |
 
 ### TTL and IDs
 
@@ -122,18 +157,18 @@ Scope: current implementation in this repository, focused on auditability and mi
 
 ### Keys and value types (instance storage)
 
-| Key | Type | Notes |
-|---|---|---|
-| `POLICIES` | `Map<u32, InsurancePolicy>` | Insurance policy records |
-| `NEXT_ID` | `u32` | Next policy ID |
-| `PREM_SCH` | `Map<u32, PremiumSchedule>` | Premium schedules |
-| `NEXT_PSCH` | `u32` | Next premium schedule ID |
-| `PAUSE_ADM` | `Address` | Pause admin |
-| `PAUSED` | `bool` | Global pause flag |
-| `PAUSED_FN` | `Map<Symbol, bool>` | Per-function pause switches |
-| `UNP_AT` | `u64` | Optional unpause timestamp |
-| `UPG_ADM` | `Address` | Upgrade admin |
-| `VERSION` | `u32` | Contract version |
+| Key         | Type                        | Notes                       |
+| ----------- | --------------------------- | --------------------------- |
+| `POLICIES`  | `Map<u32, InsurancePolicy>` | Insurance policy records    |
+| `NEXT_ID`   | `u32`                       | Next policy ID              |
+| `PREM_SCH`  | `Map<u32, PremiumSchedule>` | Premium schedules           |
+| `NEXT_PSCH` | `u32`                       | Next premium schedule ID    |
+| `PAUSE_ADM` | `Address`                   | Pause admin                 |
+| `PAUSED`    | `bool`                      | Global pause flag           |
+| `PAUSED_FN` | `Map<Symbol, bool>`         | Per-function pause switches |
+| `UNP_AT`    | `u64`                       | Optional unpause timestamp  |
+| `UPG_ADM`   | `Address`                   | Upgrade admin               |
+| `VERSION`   | `u32`                       | Contract version            |
 
 ### TTL and IDs
 
@@ -145,30 +180,30 @@ Scope: current implementation in this repository, focused on auditability and mi
 
 ### Keys and value types (instance storage)
 
-| Key | Type | Notes |
-|---|---|---|
-| `OWNER` | `Address` | Wallet owner |
-| `MEMBERS` | `Map<Address, FamilyMember>` | Family members and roles |
-| `MS_WDRAW` | `MultiSigConfig` | Multisig config for large withdrawals |
-| `MS_SPLIT` | `MultiSigConfig` | Multisig config for split changes |
-| `MS_ROLE` | `MultiSigConfig` | Multisig config for role changes |
-| `MS_EMERG` | `MultiSigConfig` | Multisig config for emergency transfer type |
-| `MS_POL` | `MultiSigConfig` | Multisig config for policy cancellation |
-| `MS_REG` | `MultiSigConfig` | Config key for regular withdrawals (read path) |
-| `PEND_TXS` | `Map<u64, PendingTransaction>` | Pending multisig transactions |
-| `EXEC_TXS` | `Map<u64, bool>` | Executed transaction markers |
-| `NEXT_TX` | `u64` | Next pending tx ID |
-| `EM_CONF` | `EmergencyConfig` | Emergency transfer constraints |
-| `EM_MODE` | `bool` | Emergency mode toggle |
-| `EM_LAST` | `u64` | Last emergency transfer timestamp |
-| `ARCH_TX` | `Map<u64, ArchivedTransaction>` | Archived executed transaction metadata |
-| `STOR_STAT` | `StorageStats` | Storage usage stats |
-| `ROLE_EXP` | `Map<Address, u64>` | Role expiry timestamps |
-| `PAUSED` | `bool` | Global pause flag |
-| `PAUSE_ADM` | `Address` | Pause admin |
-| `UPG_ADM` | `Address` | Upgrade admin |
-| `VERSION` | `u32` | Contract version |
-| `ACC_AUDIT` | `Vec<AccessAuditEntry>` | Rolling access audit trail, capped at 100 |
+| Key         | Type                            | Notes                                          |
+| ----------- | ------------------------------- | ---------------------------------------------- |
+| `OWNER`     | `Address`                       | Wallet owner                                   |
+| `MEMBERS`   | `Map<Address, FamilyMember>`    | Family members and roles                       |
+| `MS_WDRAW`  | `MultiSigConfig`                | Multisig config for large withdrawals          |
+| `MS_SPLIT`  | `MultiSigConfig`                | Multisig config for split changes              |
+| `MS_ROLE`   | `MultiSigConfig`                | Multisig config for role changes               |
+| `MS_EMERG`  | `MultiSigConfig`                | Multisig config for emergency transfer type    |
+| `MS_POL`    | `MultiSigConfig`                | Multisig config for policy cancellation        |
+| `MS_REG`    | `MultiSigConfig`                | Config key for regular withdrawals (read path) |
+| `PEND_TXS`  | `Map<u64, PendingTransaction>`  | Pending multisig transactions                  |
+| `EXEC_TXS`  | `Map<u64, bool>`                | Executed transaction markers                   |
+| `NEXT_TX`   | `u64`                           | Next pending tx ID                             |
+| `EM_CONF`   | `EmergencyConfig`               | Emergency transfer constraints                 |
+| `EM_MODE`   | `bool`                          | Emergency mode toggle                          |
+| `EM_LAST`   | `u64`                           | Last emergency transfer timestamp              |
+| `ARCH_TX`   | `Map<u64, ArchivedTransaction>` | Archived executed transaction metadata         |
+| `STOR_STAT` | `StorageStats`                  | Storage usage stats                            |
+| `ROLE_EXP`  | `Map<Address, u64>`             | Role expiry timestamps                         |
+| `PAUSED`    | `bool`                          | Global pause flag                              |
+| `PAUSE_ADM` | `Address`                       | Pause admin                                    |
+| `UPG_ADM`   | `Address`                       | Upgrade admin                                  |
+| `VERSION`   | `u32`                           | Contract version                               |
+| `ACC_AUDIT` | `Vec<AccessAuditEntry>`         | Rolling access audit trail, capped at 100      |
 
 ### TTL and IDs
 
@@ -181,13 +216,13 @@ Scope: current implementation in this repository, focused on auditability and mi
 
 ### Keys and value types (instance storage)
 
-| Key | Type | Notes |
-|---|---|---|
-| `ADMIN` | `Address` | Reporting admin |
-| `ADDRS` | `ContractAddresses` | Cross-contract address registry |
-| `REPORTS` | `Map<(Address, u64), FinancialHealthReport>` | Active reports keyed by `(user, period_key)` |
-| `ARCH_RPT` | `Map<(Address, u64), ArchivedReport>` | Archived report summaries |
-| `STOR_STAT` | `StorageStats` | Active/archive counts |
+| Key         | Type                                         | Notes                                        |
+| ----------- | -------------------------------------------- | -------------------------------------------- |
+| `ADMIN`     | `Address`                                    | Reporting admin                              |
+| `ADDRS`     | `ContractAddresses`                          | Cross-contract address registry              |
+| `REPORTS`   | `Map<(Address, u64), FinancialHealthReport>` | Active reports keyed by `(user, period_key)` |
+| `ARCH_RPT`  | `Map<(Address, u64), ArchivedReport>`        | Archived report summaries                    |
+| `STOR_STAT` | `StorageStats`                               | Active/archive counts                        |
 
 ### TTL and IDs
 
@@ -199,10 +234,10 @@ Scope: current implementation in this repository, focused on auditability and mi
 
 ### Keys and value types (instance storage)
 
-| Key | Type | Notes |
-|---|---|---|
-| `STATS` | `ExecutionStats` | Aggregate execution counters |
-| `AUDIT` | `Vec<OrchestratorAuditEntry>` | Rotating audit log, max 100 |
+| Key     | Type                          | Notes                        |
+| ------- | ----------------------------- | ---------------------------- |
+| `STATS` | `ExecutionStats`              | Aggregate execution counters |
+| `AUDIT` | `Vec<OrchestratorAuditEntry>` | Rotating audit log, max 100  |
 
 ### TTL and IDs
 

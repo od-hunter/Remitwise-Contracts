@@ -26,6 +26,7 @@ in strict order before any token interaction occurs:
 7. **Replay protection** — nonce must equal `get_nonce(from)` and is incremented after success.
 8. **Audit + event** — a `DistributionCompleted` event is emitted on success for off-chain indexing.
 9. **Schedule ID Sequencing** — `create_remittance_schedule` generates strictly monotonic IDs using a synchronized counter (`NEXT_RSCH`), ensuring no collisions across high-volume operations.
+10. **Schedule Execution Guardrails** — Remittance schedules enforce minimum intervals (1 hour), maximum lead times (1 year), and strict owner-only modifications to prevent unsafe state transitions or accidental fund depletion.
 
 ## Features
 
@@ -34,8 +35,8 @@ in strict order before any token interaction occurs:
 - Nonce-based replay protection on split initialization, split updates, distributions, and snapshot imports
 - Global pause that freezes every mutating entrypoint except `unpause`
 - Pause / unpause with transferable admin controls
-- Remittance schedules (create / modify / cancel)
-- Snapshot export/import with checksum verification
+- Remittance schedules (create / modify / cancel) with per-owner caps to prevent storage bloat
+- Snapshot export/import with checksum verification and schedule cap validation
 - Audit log (last 100 entries, ring-buffer)
 - TTL extension on initialization, split updates, snapshot imports, and schedule mutations
 
@@ -238,6 +239,67 @@ Read-only integrity check for a snapshot payload — performs all structural che
 
 **Use case:** pre-flight validation before calling `import_snapshot`, or off-chain verification of exported payloads.
 
+---
+
+## Snapshot Import Validation
+
+### Ordered Validation Pipeline
+
+`import_snapshot` runs the following checks in strict order. The first failing check aborts the
+call, appends a failed audit entry, and returns the corresponding error. No state is written on
+failure.
+
+| Step | Guard | Error returned |
+|------|-------|----------------|
+| 1 | `caller.require_auth()` + contract not paused + nonce matches | `Unauthorized` / `InvalidNonce` |
+| 2 | `snapshot.version` within `[MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION]` | `UnsupportedVersion` |
+| 3 | FNV-1a checksum matches recomputed value | `ChecksumMismatch` |
+| 4 | `snapshot.config.initialized == true` | `SnapshotNotInitialized` |
+| 5 | Each percentage field `<= 100` | `InvalidPercentageRange` |
+| 6 | Sum of all four percentage fields `== 100` | `InvalidPercentages` |
+| 7 | `snapshot.config.timestamp` and `exported_at` are not in the future | `InvalidAmount` |
+| 8 | Caller is the current on-chain owner (`existing.owner == caller`) | `Unauthorized` |
+| 9 | Snapshot owner matches caller (`snapshot.config.owner == caller`) | `OwnerMismatch` |
+| 10 | Schedule count does not exceed per-owner cap | `ScheduleCapExceeded` |
+
+### New Error Variants (discriminants 17–20)
+
+These variants were added as part of the snapshot import hardening and extend the
+`RemittanceSplitError` enum:
+
+| Discriminant | Variant | Trigger condition |
+|---|---|---|
+| 17 | `SnapshotNotInitialized` | The snapshot's `config.initialized` flag is `false`; importing an uninitialized config is rejected. |
+| 18 | `FutureTimestamp` | Reserved for future use; the pipeline currently maps future-timestamp failures to `InvalidAmount` (discriminant 4). |
+| 19 | `OwnerMismatch` | `snapshot.config.owner` does not equal the calling address, meaning the snapshot was exported by a different owner. |
+| 20 | `InvalidPercentageRange` | At least one of the four percentage fields exceeds 100; delegated to `validate_percentages`. |
+| 22 | `ScheduleCapExceeded` | The owner has reached the maximum number of allowed remittance schedules (MAX_SCHEDULES_PER_OWNER = 50). |
+
+### `verify_snapshot` Pre-flight Helper
+
+`verify_snapshot` is a **stateless, read-only** function that mirrors steps 2–7 of the
+`import_snapshot` pipeline. It is intended as a pre-flight check before committing a nonce and
+writing state.
+
+**Checks performed (in order):**
+
+| Step | Guard | Error returned |
+|------|-------|----------------|
+| 1 | Schema version within supported range | `UnsupportedVersion` |
+| 2 | FNV-1a checksum integrity | `ChecksumMismatch` |
+| 3 | `config.initialized == true` | `SnapshotNotInitialized` |
+| 4 | Per-field percentage range (`<= 100`) | `InvalidPercentageRange` |
+| 5 | Percentage sum `== 100` | `InvalidPercentages` |
+| 6 | Timestamp not in the future | `InvalidAmount` |
+
+**Not checked by `verify_snapshot`:**
+- Caller authorization / nonce (steps 1, 8 of the full pipeline)
+- Ownership match (step 9 of the full pipeline)
+
+This means `verify_snapshot` can be called by anyone without consuming a nonce or requiring the
+caller to be the contract owner. It returns `true` when all structural checks pass and `false`
+(or propagates an error) when any check fails.
+
 #### `calculate_split(env, total_amount) -> Vec<i128>`
 
 Storage-read-only calculation — returns `[spending, savings, bills, insurance]` amounts.
@@ -290,6 +352,51 @@ Returns the current configuration, or `None` if not initialized.
 
 Returns the current nonce for `address`. Pass this value as the `nonce` argument on the next call.
 
+#### `create_remittance_schedule(env, owner, amount, next_due, interval) -> u32`
+
+Creates a recurring or one-time remittance schedule.
+- **Constraints:**
+  - `owner` must be the same address as the contract `config.owner`.
+  - `amount` must be > 0.
+  - `next_due` must be in the future and ≤ 1 year from now.
+  - `interval` must be ≥ 1 hour if recurring (> 0).
+
+#### `modify_remittance_schedule(env, caller, schedule_id, amount, next_due, interval) -> bool`
+
+Updates an existing schedule.
+- **Constraints:**
+  - `caller` must be the `config.owner`.
+  - Schedule must be `active`.
+  - All creation constraints apply to the new parameters.
+
+#### `cancel_remittance_schedule(env, caller, schedule_id) -> bool`
+
+Deactivates a schedule.
+- **Constraints:**
+  - `caller` must be the `config.owner`.
+  - Schedule must be `active`.
+
+#### `get_remittance_schedules(env, owner) -> Vec<RemittanceSchedule>`
+
+Returns all remittance schedules for the specified owner, ordered by ID ascending.
+
+- **Ordering Guarantee:** Results are deterministically ordered by schedule ID ascending, ensuring consistent results across queries.
+
+#### `get_remittance_schedules_paginated(env, owner, from_index, limit) -> SchedulePage`
+
+Returns remittance schedules for the specified owner with pagination support.
+
+- **Parameters:**
+  - `owner`: The owner address to query
+  - `from_index`: Zero-based starting index in the schedule list
+  - `limit`: Maximum number of schedules to return (clamped to 50)
+- **Returns:** `SchedulePage` with items ordered by ID ascending, next cursor, and count
+- **Ordering Guarantee:** Results are deterministically ordered by schedule ID ascending, providing stable pagination cursors
+
+#### `get_remittance_schedule(env, schedule_id) -> Option<RemittanceSchedule>`
+
+Returns a single schedule by ID, or `None` if not found.
+
 ## Error Reference
 
 ```rust
@@ -310,6 +417,10 @@ pub enum RemittanceSplitError {
     DeadlineExpired = 14,          // request expired
     RequestHashMismatch = 15,      // request hash binding failed
     NonceAlreadyUsed = 16,         // replay duplicate protection
+    SnapshotNotInitialized = 17,   // snapshot config.initialized is false
+    FutureTimestamp = 18,          // reserved; pipeline uses InvalidAmount for future timestamps
+    OwnerMismatch = 19,            // snapshot.config.owner != caller
+    InvalidPercentageRange = 20,   // a percentage field exceeds 100
 }
 ```
 
@@ -323,6 +434,39 @@ pub enum RemittanceSplitError {
 | `("split", DistributionCompleted)` | `(from: Address, total_amount: i128)` | `distribute_usdc` succeeds |
 | `("split", SnapshotExported)` | `caller: Address` | `export_snapshot` succeeds |
 | `("split", SnapshotImported)` | `caller: Address` | `import_snapshot` succeeds |
+
+## Schedule Caps
+
+To prevent storage bloat and ensure efficient contract operation, each owner is limited to a maximum of **50 remittance schedules** (`MAX_SCHEDULES_PER_OWNER = 50`).
+
+### Cap Enforcement
+
+The schedule cap is enforced in two critical paths:
+
+1. **Schedule Creation**: `create_remittance_schedule` checks the owner's current schedule count before creating a new schedule. If the owner already has 50 active schedules, the function returns `ScheduleCapExceeded`.
+
+2. **Snapshot Import**: `import_snapshot` validates that the snapshot contains no more than 50 schedules for the owner. This prevents bypassing the cap through migration/data import.
+
+### Cap Behavior
+
+- **Per-Owner**: Caps are enforced independently per owner. Different owners can each have up to 50 schedules.
+- **Active Schedules Only**: Only active schedules count toward the cap. Cancelled schedules are removed from the owner's schedule index.
+- **Fail-Closed**: Both creation and import paths fail closed - if the cap would be exceeded, the operation is rejected entirely.
+
+### Error Handling
+
+When the cap is exceeded, the contract returns:
+```rust
+RemittanceSplitError::ScheduleCapExceeded
+```
+
+This error is emitted before any state changes, ensuring the operation is atomic.
+
+### Recovery
+
+To create new schedules after reaching the cap:
+1. Cancel existing schedules using `cancel_remittance_schedule`
+2. Create new schedules (now under the cap)
 
 ## Security Assumptions
 

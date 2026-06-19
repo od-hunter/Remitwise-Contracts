@@ -1,422 +1,789 @@
 #![no_std]
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::manual_inspect)]
-#![allow(dead_code)]
-#![allow(unused_imports)]
-
-//! # Cross-Contract Orchestrator
-//!
-//! The Cross-Contract Orchestrator coordinates automated remittance allocation across
-//! multiple Soroban smart contracts in the Remitwise ecosystem. It implements atomic,
-//! multi-contract operations with family wallet permission enforcement.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, Address, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Env, Map,
+    Symbol, Vec,
 };
-use remitwise_common::{EventCategory, EventPriority, RemitwiseEvents};
 
-#[cfg(test)]
-mod test;
+mod interface {
+    use soroban_sdk::{contractclient, Address, Env, Vec};
 
-// ============================================================================
-// Contract Client Interfaces for Cross-Contract Calls
-// ============================================================================
+    #[contractclient(name = "FamilyWalletClient")]
+    pub trait FamilyWalletInterface {
+        fn check_spending_limit(env: Env, user: Address, amount: i128) -> bool;
+    }
 
-#[contractclient(name = "FamilyWalletClient")]
-pub trait FamilyWalletTrait {
-    fn check_spending_limit(env: Env, caller: Address, amount: i128) -> bool;
+    #[contractclient(name = "RemittanceSplitClient")]
+    pub trait RemittanceSplitInterface {
+        fn calculate_split(env: Env, total_amount: i128) -> Vec<i128>;
+    }
+
+    #[contractclient(name = "SavingsGoalsClient")]
+    pub trait SavingsGoalsInterface {
+        fn add_to_goal(env: Env, user: Address, goal_id: u32, amount: i128) -> bool;
+    }
+
+    #[contractclient(name = "BillPaymentsClient")]
+    pub trait BillPaymentsInterface {
+        fn pay_bill(env: Env, user: Address, bill_id: u32, amount: i128) -> bool;
+    }
+
+    #[contractclient(name = "InsuranceClient")]
+    pub trait InsuranceInterface {
+        fn pay_premium(env: Env, user: Address, policy_id: u32, amount: i128) -> bool;
+    }
 }
 
-#[contractclient(name = "RemittanceSplitClient")]
-pub trait RemittanceSplitTrait {
-    fn calculate_split(env: Env, total_amount: i128) -> Vec<i128>;
+#[contracttype]
+#[derive(Clone)]
+pub struct OrchestratorAuditEntry {
+    pub operation: Symbol,
+    pub caller: Address,
+    pub timestamp: u64,
+    pub success: bool,
 }
 
-#[contractclient(name = "SavingsGoalsClient")]
-pub trait SavingsGoalsTrait {
-    fn add_to_goal(env: Env, caller: Address, goal_id: u32, amount: i128) -> i128;
+use remitwise_common::{EventCategory, EventPriority, RemitwiseEvents, CONTRACT_VERSION};
+
+// Storage TTL constants for active data
+const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280;
+const INSTANCE_BUMP_AMOUNT: u32 = 518400;
+
+// Maximum number of used nonces tracked per address before the oldest are pruned.
+const MAX_USED_NONCES_PER_ADDR: u32 = 256;
+/// Maximum ledger seconds a signed request may remain valid after creation.
+const MAX_DEADLINE_WINDOW_SECS: u64 = 3600; // 1 hour
+
+/// Maximum number of audit entries retained in the ring-buffer.
+/// When the log reaches this cap the oldest entry is evicted to bound
+/// instance-storage rent and read cost.
+const MAX_AUDIT_ENTRIES: u32 = 100;
+
+/// A single entry in the bounded audit ring-buffer.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditEntry {
+    pub operation: Symbol,
+    pub executor: Address,
+    pub timestamp: u64,
+    pub success: bool,
 }
 
-#[contractclient(name = "BillPaymentsClient")]
-pub trait BillPaymentsTrait {
-    fn pay_bill(env: Env, caller: Address, bill_id: u32);
+const EXEC_LOCK: Symbol = symbol_short!("EXEC_LOCK");
+const AUDIT: Symbol = symbol_short!("AUDIT");
+
+/// RAII guard to ensure the execution lock is released on drop.
+pub struct LockGuard {
+    env: Env,
 }
 
-#[contractclient(name = "InsuranceClient")]
-pub trait InsuranceTrait {
-    fn pay_premium(env: Env, caller: Address, policy_id: u32) -> bool;
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        self.env.storage().instance().set(&EXEC_LOCK, &false);
+    }
 }
 
-// ============================================================================
-// Data Types
-// ============================================================================
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionStats {
+    pub total_executions: u32,
+    pub successful_executions: u32,
+    pub failed_executions: u32,
+    pub last_execution_time: u64,
+    /// Total audit entries evicted due to ring-buffer cap enforcement.
+    pub evicted_entries: u32,
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum OrchestratorError {
-    PermissionDenied = 1,
-    SpendingLimitExceeded = 2,
-    SavingsDepositFailed = 3,
-    BillPaymentFailed = 4,
-    InsurancePaymentFailed = 5,
-    RemittanceSplitFailed = 6,
-    InvalidAmount = 7,
-    InvalidContractAddress = 8,
-    CrossContractCallFailed = 9,
-    ReentrancyDetected = 10,
-    DuplicateContractAddress = 11,
-    ContractNotConfigured = 12,
-    SelfReferenceNotAllowed = 13,
+    Unauthorized = 1,
+    InvalidAmount = 2,
+    Overflow = 3,
+    CrossContractCallFailed = 4,
+    NonceAlreadyUsed = 5,
+    InvalidNonce = 6,
+    DeadlineExpired = 7,
+    ExecutionLocked = 8,
+    InvalidDependency = 9,
+    DuplicateDependency = 10,
 }
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum ExecutionState {
-    Idle = 0,
-    Executing = 1,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RemittanceFlowResult {
-    pub total_amount: i128,
-    pub spending_amount: i128,
-    pub savings_amount: i128,
-    pub bills_amount: i128,
-    pub insurance_amount: i128,
-    pub savings_success: bool,
-    pub bills_success: bool,
-    pub insurance_success: bool,
-    pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RemittanceFlowEvent {
-    pub caller: Address,
-    pub total_amount: i128,
-    pub allocations: Vec<i128>,
-    pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RemittanceFlowErrorEvent {
-    pub caller: Address,
-    pub failed_step: Symbol,
-    pub error_code: u32,
-    pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionStats {
-    pub total_flows_executed: u64,
-    pub total_flows_failed: u64,
-    pub total_amount_processed: i128,
-    pub last_execution: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OrchestratorAuditEntry {
-    pub caller: Address,
-    pub operation: Symbol,
-    pub amount: i128,
-    pub success: bool,
-    pub timestamp: u64,
-    pub error_code: Option<u32>,
-}
-
-const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280;
-const INSTANCE_BUMP_AMOUNT: u32 = 518400;
-const MAX_AUDIT_ENTRIES: u32 = 100;
-
-// ============================================================================
-// Contract Implementation
-// ============================================================================
 
 #[contract]
 pub struct Orchestrator;
 
 #[contractimpl]
 impl Orchestrator {
-    // -----------------------------------------------------------------------
-    // Reentrancy Guard
-    // -----------------------------------------------------------------------
-
-    fn acquire_execution_lock(env: &Env) -> Result<(), OrchestratorError> {
-        let state: ExecutionState = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("EXEC_ST"))
-            .unwrap_or(ExecutionState::Idle);
-
-        if state == ExecutionState::Executing {
-            return Err(OrchestratorError::ReentrancyDetected);
-        }
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("EXEC_ST"), &ExecutionState::Executing);
-
-        Ok(())
-    }
-
-    fn release_execution_lock(env: &Env) {
-        env.storage()
-            .instance()
-            .set(&symbol_short!("EXEC_ST"), &ExecutionState::Idle);
-    }
-
-    pub fn get_execution_state(env: Env) -> ExecutionState {
-        env.storage()
-            .instance()
-            .get(&symbol_short!("EXEC_ST"))
-            .unwrap_or(ExecutionState::Idle)
-    }
-
-    // -----------------------------------------------------------------------
-    // Main Entry Points
-    // -----------------------------------------------------------------------
-
-    #[allow(clippy::too_many_arguments)]
+    /// Executes the full remittance flow across multiple contracts.
+    /// This is protected against reentrancy.
     pub fn execute_remittance_flow(
         env: Env,
         caller: Address,
         total_amount: i128,
-        family_wallet_addr: Address,
-        remittance_split_addr: Address,
-        savings_addr: Address,
-        bills_addr: Address,
-        insurance_addr: Address,
+        family_wallet: Address,
+        remittance_split: Address,
+        savings: Address,
+        bills: Address,
+        insurance: Address,
         goal_id: u32,
         bill_id: u32,
         policy_id: u32,
-    ) -> Result<RemittanceFlowResult, OrchestratorError> {
-        Self::acquire_execution_lock(&env)?;
+    ) -> Result<(), OrchestratorError> {
         caller.require_auth();
-        let timestamp = env.ledger().timestamp();
 
-        let res = (|| {
-            Self::validate_remittance_flow_addresses(
+        if total_amount <= 0 {
+            return Err(OrchestratorError::InvalidAmount);
+        }
+
+        // Use a scope to ensure the guard is dropped (and lock released)
+        // before we audit and return.
+        let result = {
+            /// The guard acquires the lock on creation and releases it on drop.
+            /// This ensures the lock is released even if we return early via `?`.
+            let _guard = Self::acquire_execution_lock(&env)?;
+
+            Self::perform_remittance_flow(
                 &env,
-                &family_wallet_addr,
-                &remittance_split_addr,
-                &savings_addr,
-                &bills_addr,
-                &insurance_addr,
-            )?;
-
-            if total_amount <= 0 {
-                return Err(OrchestratorError::InvalidAmount);
-            }
-
-            Self::check_spending_limit(&env, &family_wallet_addr, &caller, total_amount)?;
-
-            let allocations = Self::extract_allocations(&env, &remittance_split_addr, total_amount)?;
-
-            let spending_amount = allocations.get(0).unwrap_or(0);
-            let savings_amount = allocations.get(1).unwrap_or(0);
-            let bills_amount = allocations.get(2).unwrap_or(0);
-            let insurance_amount = allocations.get(3).unwrap_or(0);
-
-            let savings_success = Self::deposit_to_savings(&env, &savings_addr, &caller, goal_id, savings_amount).is_ok();
-            let bills_success = Self::execute_bill_payment_internal(&env, &bills_addr, &caller, bill_id).is_ok();
-            let insurance_success = Self::pay_insurance_premium(&env, &insurance_addr, &caller, policy_id).is_ok();
-
-            let flow_result = RemittanceFlowResult {
+                &caller,
                 total_amount,
-                spending_amount,
-                savings_amount,
-                bills_amount,
-                insurance_amount,
-                savings_success,
-                bills_success,
-                insurance_success,
-                timestamp,
-            };
+                &family_wallet,
+                &remittance_split,
+                &savings,
+                &bills,
+                &insurance,
+                goal_id,
+                bill_id,
+                policy_id,
+            )
+        };
 
-            Self::emit_success_event(&env, &caller, total_amount, &allocations, timestamp);
-            Ok(flow_result)
-        })();
+        // 4. Audit result (lock is already released here)
+        Self::append_audit(&env, symbol_short!("remit"), &caller, result.is_ok());
 
-        if let Err(e) = &res {
-             Self::emit_error_event(&env, &caller, symbol_short!("flow"), *e as u32, timestamp);
-        }
-
-        Self::release_execution_lock(&env);
-        res
-    }
-
-    pub fn execute_savings_deposit(
-        env: Env,
-        caller: Address,
-        amount: i128,
-        family_wallet_addr: Address,
-        savings_addr: Address,
-        goal_id: u32,
-        nonce: u64,
-    ) -> Result<(), OrchestratorError> {
-        Self::acquire_execution_lock(&env)?;
-        caller.require_auth();
-        let timestamp = env.ledger().timestamp();
-        // Address validation
-        Self::validate_two_addresses(&env, &family_wallet_addr, &savings_addr).map_err(|e| {
-            Self::release_execution_lock(&env);
-            e
-        })?;
-        // Nonce / replay protection
-        Self::consume_nonce(&env, &caller, symbol_short!("exec_sav"), nonce).map_err(|e| {
-            Self::release_execution_lock(&env);
-            e
-        })?;
-
-        let result = (|| {
-            Self::check_spending_limit(&env, &family_wallet_addr, &caller, amount)?;
-            Self::deposit_to_savings(&env, &savings_addr, &caller, goal_id, amount)?;
-            Ok(())
-        })();
-
-        Self::release_execution_lock(&env);
         result
     }
 
-    pub fn execute_bill_payment(
-        env: Env,
-        caller: Address,
-        amount: i128,
-        family_wallet_addr: Address,
-        bills_addr: Address,
-        bill_id: u32,
-        nonce: u64,
-    ) -> Result<(), OrchestratorError> {
-        Self::acquire_execution_lock(&env)?;
-        caller.require_auth();
-        let result = (|| {
-            Self::check_spending_limit(&env, &family_wallet_addr, &caller, amount)?;
-            Self::execute_bill_payment_internal(&env, &bills_addr, &caller, bill_id)?;
-            Ok(())
-        })();
-        Self::release_execution_lock(&env);
-        result
-    }
-
-    pub fn execute_insurance_payment(
-        env: Env,
-        caller: Address,
-        amount: i128,
-        family_wallet_addr: Address,
-        insurance_addr: Address,
-        policy_id: u32,
-        nonce: u64,
-    ) -> Result<(), OrchestratorError> {
-        Self::acquire_execution_lock(&env)?;
-        caller.require_auth();
-        let result = (|| {
-            Self::check_spending_limit(&env, &family_wallet_addr, &caller, amount)?;
-            Self::pay_insurance_premium(&env, &insurance_addr, &caller, policy_id)?;
-            Ok(())
-        })();
-        Self::release_execution_lock(&env);
-        result
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal Helpers
-    // -----------------------------------------------------------------------
-
-    fn check_spending_limit(env: &Env, family_wallet_addr: &Address, caller: &Address, amount: i128) -> Result<(), OrchestratorError> {
-        let wallet_client = FamilyWalletClient::new(env, family_wallet_addr);
-        if wallet_client.check_spending_limit(caller, &amount) {
-            Ok(())
-        } else {
-            Err(OrchestratorError::SpendingLimitExceeded)
-        }
-    }
-
-    fn extract_allocations(env: &Env, split_addr: &Address, total: i128) -> Result<Vec<i128>, OrchestratorError> {
-        let client = RemittanceSplitClient::new(env, split_addr);
-        Ok(client.calculate_split(&total))
-    }
-
-    fn deposit_to_savings(env: &Env, addr: &Address, caller: &Address, goal_id: u32, amount: i128) -> Result<(), OrchestratorError> {
-        let client = SavingsGoalsClient::new(env, addr);
-        client.add_to_goal(caller, &goal_id, &amount);
-        Ok(())
-    }
-
-    fn execute_bill_payment_internal(env: &Env, addr: &Address, caller: &Address, bill_id: u32) -> Result<(), OrchestratorError> {
-        let client = BillPaymentsClient::new(env, addr);
-        client.pay_bill(caller, &bill_id);
-        Ok(())
-    }
-
-    fn pay_insurance_premium(env: &Env, addr: &Address, caller: &Address, policy_id: u32) -> Result<(), OrchestratorError> {
-        let client = InsuranceClient::new(env, addr);
-        client.pay_premium(caller, &policy_id);
-        Ok(())
-    }
-
-    fn validate_remittance_flow_addresses(
+    fn perform_remittance_flow(
         env: &Env,
-        family: &Address,
-        split: &Address,
+        caller: &Address,
+        total_amount: i128,
+        family_wallet: &Address,
+        remittance_split: &Address,
         savings: &Address,
         bills: &Address,
         insurance: &Address,
+        goal_id: u32,
+        bill_id: u32,
+        policy_id: u32,
     ) -> Result<(), OrchestratorError> {
-        let current = env.current_contract_address();
-        if family == &current || split == &current || savings == &current || bills == &current || insurance == &current {
-            return Err(OrchestratorError::SelfReferenceNotAllowed);
+        // Use interfaces to call downstream contracts
+        // This is a simplified implementation of the flow logic
+
+        // 1. Check permission/spending limit
+        let fw_client = interface::FamilyWalletClient::new(env, family_wallet);
+        if !fw_client.check_spending_limit(caller, &total_amount) {
+            return Err(OrchestratorError::Unauthorized);
         }
-        if family == split || family == savings || family == bills || family == insurance ||
-           split == savings || split == bills || split == insurance ||
-           savings == bills || savings == insurance ||
-           bills == insurance {
-            return Err(OrchestratorError::DuplicateContractAddress);
+
+        // 2. Calculate split
+        let rs_client = interface::RemittanceSplitClient::new(env, remittance_split);
+        let allocations = rs_client.calculate_split(&total_amount);
+
+        if allocations.len() < 4 {
+            return Err(OrchestratorError::InvalidAmount);
+        }
+
+        let _spending_amt = allocations.get_unchecked(0);
+        let savings_amt = allocations.get_unchecked(1);
+        let bills_amt = allocations.get_unchecked(2);
+        let insurance_amt = allocations.get_unchecked(3);
+
+        // 3. Downstream calls
+        if savings_amt > 0 {
+            let s_client = interface::SavingsGoalsClient::new(env, savings);
+            s_client.add_to_goal(caller, &goal_id, &savings_amt);
+        }
+
+        if bills_amt > 0 {
+            let b_client = interface::BillPaymentsClient::new(env, bills);
+            b_client.pay_bill(caller, &bill_id, &bills_amt);
+        }
+
+        if insurance_amt > 0 {
+            let i_client = interface::InsuranceClient::new(env, insurance);
+            i_client.pay_premium(caller, &policy_id, &insurance_amt);
+        }
+
+        Ok(())
+    }
+
+    /// Initialize the orchestrator with dependency contract addresses.
+    ///
+    /// # Errors
+    /// - `Unauthorized` if already initialized or caller not authorized
+    /// - `DuplicateDependency` if any addresses are duplicates or self-reference
+    pub fn init(
+        env: Env,
+        caller: Address,
+        family_wallet: Address,
+        remittance_split: Address,
+        savings_goals: Address,
+        bill_payments: Address,
+        insurance: Address,
+    ) -> Result<bool, OrchestratorError> {
+        caller.require_auth();
+
+        let existing: Option<Address> = env.storage().instance().get(&symbol_short!("OWNER"));
+        if existing.is_some() {
+            return Err(OrchestratorError::Unauthorized);
+        }
+
+        // Validate no duplicates and no self-reference
+        let addresses = vec![
+            &env,
+            family_wallet.clone(),
+            remittance_split.clone(),
+            savings_goals.clone(),
+            bill_payments.clone(),
+            insurance.clone(),
+        ];
+
+        for i in 0..addresses.len() {
+            if let Some(addr_i) = addresses.get(i) {
+                if addr_i == caller {
+                    return Err(OrchestratorError::DuplicateDependency);
+                }
+                for j in (i + 1)..addresses.len() {
+                    if let Some(addr_j) = addresses.get(j) {
+                        if addr_i == addr_j {
+                            return Err(OrchestratorError::DuplicateDependency);
+                        }
+                    }
+                }
+            }
+        }
+
+        Self::extend_instance_ttl(&env);
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("OWNER"), &caller);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("FW_ADDR"), &family_wallet);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("RS_ADDR"), &remittance_split);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("SG_ADDR"), &savings_goals);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("BP_ADDR"), &bill_payments);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("INS_ADDR"), &insurance);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("EXEC_LOCK"), &false);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("NONCES"), &Map::<Address, u64>::new(&env));
+
+        let stats = ExecutionStats {
+            total_executions: 0,
+            successful_executions: 0,
+            failed_executions: 0,
+            last_execution_time: 0,
+            evicted_entries: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&symbol_short!("STATS"), &stats);
+
+        /// Emit orchestrator initialization event
+        /// Topic: ("Remitwise", EventCategory::System, EventPriority::High, "init_ok")
+        /// Payload: (caller: Address)
+        /// Emitted when the orchestrator contract is successfully initialized
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::System,
+            EventPriority::High,
+            symbol_short!("init_ok"),
+            caller,
+        );
+
+        Ok(true)
+    }
+
+    /// Execute a remittance flow with replay protection.
+    ///
+    /// # Security
+    /// - Authorization-first pattern
+    /// - Execution lock to prevent cross-contract reentrancy
+    /// - Nonce replay protection with deadline window validation
+    /// - Request hash binding to prevent parameter-swap attacks
+    ///
+    /// # Errors
+    /// - `Unauthorized` if executor doesn't authorize or contract not initialized
+    /// - `InvalidAmount` if amount <= 0
+    /// - `DeadlineExpired` if deadline is invalid or passed
+    /// - `InvalidNonce` if nonce or hash is invalid
+    /// - `NonceAlreadyUsed` if nonce was already used
+    /// - `ExecutionLocked` if reentrancy detected
+    pub fn execute_remittance_flow_signed(
+        env: Env,
+        executor: Address,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
+        request_hash: u64,
+    ) -> Result<bool, OrchestratorError> {
+        // 1. Authorization first — before any storage reads
+        executor.require_auth();
+
+        // 2. Validate initialization
+        let _owner: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("OWNER"))
+            .ok_or(OrchestratorError::Unauthorized)?;
+
+        // 3. Check amount validity
+        if amount <= 0 {
+            Self::append_audit(&env, symbol_short!("flow_exec"), &executor, false);
+            return Err(OrchestratorError::InvalidAmount);
+        }
+
+        // 4. Reentrancy guard: check execution lock
+        let is_locked: bool = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("EXEC_LOCK"))
+            .unwrap_or(false);
+
+        if is_locked {
+            Self::append_audit(&env, symbol_short!("flow_exec"), &executor, false);
+            return Err(OrchestratorError::ExecutionLocked);
+        }
+
+        // 5. Hardened nonce validation with deadline + hash binding
+        let expected_hash = Self::compute_request_hash(
+            symbol_short!("flow"),
+            executor.clone(),
+            nonce,
+            amount,
+            deadline,
+        );
+        Self::require_nonce_hardened(
+            &env,
+            &executor,
+            nonce,
+            deadline,
+            request_hash,
+            expected_hash,
+        )?;
+
+        /// Emit flow lifecycle event - flow started
+        /// Topic: ("Remitwise", EventCategory::Transaction, EventPriority::High, "flow")
+        /// Payload: (executor: Address, amount: i128)
+        /// Emitted when a remittance flow execution begins after passing validation
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::High,
+            symbol_short!("flow"),
+            (executor.clone(), amount),
+        );
+
+        // 6. Set execution lock
+        Self::extend_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("EXEC_LOCK"), &true);
+
+        // 7. Execute remittance flow
+        let result = Self::execute_flow_internal(&env, &executor, amount);
+
+        // 8. Clear execution lock
+        env.storage()
+            .instance()
+            .set(&symbol_short!("EXEC_LOCK"), &false);
+
+        // 9. On success: advance nonce, update stats, record audit, emit event
+        match result {
+            Ok(_) => {
+                Self::increment_nonce(&env, &executor)?;
+                Self::update_execution_stats(&env, true);
+                Self::append_audit(&env, symbol_short!("flow_exec"), &executor, true);
+
+                /// Emit flow lifecycle event - flow completed successfully
+                /// Topic: ("Remitwise", EventCategory::Transaction, EventPriority::High, "flow_ok")
+                /// Payload: (executor: Address, amount: i128)
+                /// Emitted when a remittance flow completes successfully
+                RemitwiseEvents::emit(
+                    &env,
+                    EventCategory::Transaction,
+                    EventPriority::High,
+                    symbol_short!("flow_ok"),
+                    (executor, amount),
+                );
+
+                Ok(true)
+            }
+            Err(e) => {
+                Self::update_execution_stats(&env, false);
+                Self::append_audit(&env, symbol_short!("flow_exec"), &executor, false);
+
+                /// Emit flow lifecycle event - flow failed
+                /// Topic: ("Remitwise", EventCategory::Transaction, EventPriority::High, "flow_fail")
+                /// Payload: (executor: Address, error_code: u32)
+                /// Emitted when a remittance flow fails. Error code corresponds to OrchestratorError enum.
+                /// Does not leak sensitive amounts - only includes error code for debugging.
+                RemitwiseEvents::emit(
+                    &env,
+                    EventCategory::Transaction,
+                    EventPriority::High,
+                    symbol_short!("flow_fail"),
+                    (executor, e as u32),
+                );
+
+                Err(e)
+            }
+        }
+    }
+
+    /// Get the current execution nonce for an address.
+    pub fn get_nonce(env: Env, address: Address) -> u64 {
+        Self::get_nonce_value(&env, &address)
+    }
+
+    /// Get current execution statistics, including evicted audit entry count.
+    pub fn get_execution_stats(env: Env) -> Option<ExecutionStats> {
+        Self::extend_instance_ttl(&env);
+        env.storage().instance().get(&symbol_short!("STATS"))
+    }
+
+    /// Get a page of audit log entries.
+    ///
+    /// # Parameters
+    /// - `from_index`: zero-based cursor into the current bounded window (oldest = 0)
+    /// - `limit`: entries to return; clamped to `[1, MAX_AUDIT_ENTRIES]`; 0 → default 20
+    ///
+    /// # Retention note
+    /// The log is a ring-buffer capped at `MAX_AUDIT_ENTRIES`. Entries are ordered
+    /// oldest-to-newest within the current window. Callers should treat `from_index`
+    /// as a position in the rotated window, not a global immutable ID.
+    ///
+    /// # Returns
+    /// Empty vec when `from_index` is past the end of the log (safe default).
+    pub fn get_audit_log(env: Env, from_index: u32, limit: u32) -> Vec<AuditEntry> {
+        let log: Option<Vec<AuditEntry>> = env.storage().instance().get(&symbol_short!("AUDIT"));
+        let log = log.unwrap_or_else(|| Vec::new(&env));
+        let len = log.len();
+
+        // Clamp limit to [1, MAX_AUDIT_ENTRIES]; 0 → default 20
+        let cap = Self::clamp_limit(limit);
+
+        // Out-of-range cursor → empty page (safe default)
+        if from_index >= len {
+            return Vec::new(&env);
+        }
+
+        let end = from_index.saturating_add(cap).min(len);
+        let mut items = Vec::new(&env);
+        for i in from_index..end {
+            if let Some(entry) = log.get(i) {
+                items.push_back(entry);
+            }
+        }
+
+        items
+    }
+
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("VERSION"))
+            .unwrap_or(CONTRACT_VERSION)
+    }
+
+    pub fn set_version(
+        env: Env,
+        caller: Address,
+        new_version: u32,
+    ) -> Result<bool, OrchestratorError> {
+        caller.require_auth();
+
+        let owner: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("OWNER"))
+            .ok_or(OrchestratorError::Unauthorized)?;
+
+        if caller != owner {
+            return Err(OrchestratorError::Unauthorized);
+        }
+
+        let prev = Self::get_version(env.clone());
+        env.storage()
+            .instance()
+            .set(&symbol_short!("VERSION"), &new_version);
+
+        /// Emit orchestrator upgrade event
+        /// Topic: ("orch", "upgraded")
+        /// Payload: (previous_version: u32, new_version: u32)
+        /// Emitted when the contract version is upgraded by the owner
+        env.events().publish(
+            (symbol_short!("orch"), symbol_short!("upgraded")),
+            (prev, new_version),
+        );
+
+        Ok(true)
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    fn execute_flow_internal(
+        env: &Env,
+        _executor: &Address,
+        _amount: i128,
+    ) -> Result<bool, OrchestratorError> {
+        let _owner: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("OWNER"))
+            .ok_or(OrchestratorError::Unauthorized)?;
+        Ok(true)
+    }
+
+    fn get_nonce_value(env: &Env, address: &Address) -> u64 {
+        let nonces: Option<Map<Address, u64>> =
+            env.storage().instance().get(&symbol_short!("NONCES"));
+        nonces
+            .as_ref()
+            .and_then(|m: &Map<Address, u64>| m.get(address.clone()))
+            .unwrap_or(0)
+    }
+
+    fn require_nonce(env: &Env, address: &Address, expected: u64) -> Result<(), OrchestratorError> {
+        let current = Self::get_nonce_value(env, address);
+        if expected != current {
+            return Err(OrchestratorError::InvalidNonce);
         }
         Ok(())
     }
 
-    fn emit_success_event(env: &Env, caller: &Address, total: i128, allocations: &Vec<i128>, timestamp: u64) {
-        env.events().publish((symbol_short!("flow_ok"),), RemittanceFlowEvent {
-            caller: caller.clone(),
-            total_amount: total,
-            allocations: allocations.clone(),
-            timestamp,
-        });
-    }
+    /// Hardened nonce validation:
+    /// 1. Deadline must be in the future and within `MAX_DEADLINE_WINDOW_SECS`
+    /// 2. Sequential counter check
+    /// 3. Used-nonce double-spend check
+    /// 4. Request hash binding
+    fn require_nonce_hardened(
+        env: &Env,
+        address: &Address,
+        nonce: u64,
+        deadline: u64,
+        request_hash: u64,
+        expected_hash: u64,
+    ) -> Result<(), OrchestratorError> {
+        let now = env.ledger().timestamp();
 
-    fn emit_error_event(env: &Env, caller: &Address, step: Symbol, code: u32, timestamp: u64) {
-        env.events().publish((symbol_short!("flow_err"),), RemittanceFlowErrorEvent {
-            caller: caller.clone(),
-            failed_step: step,
-            error_code: code,
-            timestamp,
-        });
-    }
-
-    pub fn get_execution_stats(env: Env) -> ExecutionStats {
-        env.storage().instance().get(&symbol_short!("STATS")).unwrap_or(ExecutionStats {
-            total_flows_executed: 0,
-            total_flows_failed: 0,
-            total_amount_processed: 0,
-            last_execution: 0,
-        })
-    }
-
-    pub fn get_audit_log(env: Env, from_index: u32, limit: u32) -> Vec<OrchestratorAuditEntry> {
-        let log: Vec<OrchestratorAuditEntry> = env.storage().instance().get(&symbol_short!("AUDIT")).unwrap_or_else(|| Vec::new(&env));
-        let mut out = Vec::new(&env);
-        let len = log.len();
-        let end = from_index.saturating_add(limit).min(len);
-        for i in from_index..end {
-            if let Some(e) = log.get(i) { out.push_back(e); }
+        if deadline <= now {
+            return Err(OrchestratorError::DeadlineExpired);
         }
-        out
+        if deadline > now + MAX_DEADLINE_WINDOW_SECS {
+            return Err(OrchestratorError::DeadlineExpired);
+        }
+
+        Self::require_nonce(env, address, nonce)?;
+
+        if Self::is_nonce_used(env, address, nonce) {
+            return Err(OrchestratorError::NonceAlreadyUsed);
+        }
+
+        if request_hash != expected_hash {
+            return Err(OrchestratorError::InvalidNonce);
+        }
+
+        Ok(())
+    }
+
+    fn acquire_execution_lock(env: &Env) -> Result<LockGuard, OrchestratorError> {
+        let is_locked: bool = env.storage().instance().get(&EXEC_LOCK).unwrap_or(false);
+        if is_locked {
+            return Err(OrchestratorError::ExecutionLocked);
+        }
+        env.storage().instance().set(&EXEC_LOCK, &true);
+        Ok(LockGuard { env: env.clone() })
+    }
+
+    fn append_audit(env: &Env, operation: Symbol, caller: &Address, success: bool) {
+        let timestamp = env.ledger().timestamp();
+        let mut log: Vec<AuditEntry> = env
+            .storage()
+            .instance()
+            .get(&AUDIT)
+            .unwrap_or_else(|| Vec::new(env));
+        if log.len() >= MAX_AUDIT_ENTRIES {
+            let mut new_log = Vec::new(env);
+            for i in 1..log.len() {
+                if let Some(entry) = log.get(i) {
+                    new_log.push_back(entry);
+                }
+            }
+            log = new_log;
+            // Track eviction in stats
+            let mut stats: ExecutionStats = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("STATS"))
+                .unwrap_or(ExecutionStats {
+                    total_executions: 0,
+                    successful_executions: 0,
+                    failed_executions: 0,
+                    last_execution_time: 0,
+                    evicted_entries: 0,
+                });
+            stats.evicted_entries = stats.evicted_entries.saturating_add(1);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("STATS"), &stats);
+        }
+        log.push_back(AuditEntry {
+            operation,
+            executor: caller.clone(),
+            timestamp,
+            success,
+        });
+        env.storage().instance().set(&AUDIT, &log);
+    }
+
+    pub fn get_execution_state(env: Env) -> bool {
+        env.storage().instance().get(&EXEC_LOCK).unwrap_or(false)
+    }
+
+    fn is_nonce_used(env: &Env, address: &Address, nonce: u64) -> bool {
+        let key = symbol_short!("USED_N");
+        let map: Option<Map<Address, Vec<u64>>> = env.storage().instance().get(&key);
+        match map {
+            None => false,
+            Some(m) => match m.get(address.clone()) {
+                None => false,
+                Some(used) => used.contains(nonce),
+            },
+        }
+    }
+
+    fn mark_nonce_used(env: &Env, address: &Address, nonce: u64) {
+        let key = symbol_short!("USED_N");
+        let mut map: Map<Address, Vec<u64>> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| Map::new(env));
+
+        let mut used: Vec<u64> = map.get(address.clone()).unwrap_or_else(|| Vec::new(env));
+
+        if used.len() >= MAX_USED_NONCES_PER_ADDR {
+            let mut trimmed = Vec::new(env);
+            for i in 1..used.len() {
+                if let Some(v) = used.get(i) {
+                    trimmed.push_back(v);
+                }
+            }
+            used = trimmed;
+        }
+
+        used.push_back(nonce);
+        map.set(address.clone(), used);
+        env.storage().instance().set(&key, &map);
+    }
+
+    fn increment_nonce(env: &Env, address: &Address) -> Result<(), OrchestratorError> {
+        let current = Self::get_nonce_value(env, address);
+        Self::mark_nonce_used(env, address, current);
+
+        let next = current.checked_add(1).ok_or(OrchestratorError::Overflow)?;
+        let mut nonces: Map<Address, u64> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("NONCES"))
+            .unwrap_or_else(|| Map::new(env));
+        nonces.set(address.clone(), next);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("NONCES"), &nonces);
+        Ok(())
+    }
+
+    fn compute_request_hash(
+        operation: Symbol,
+        _caller: Address,
+        nonce: u64,
+        amount: i128,
+        deadline: u64,
+    ) -> u64 {
+        let op_bits: u64 = operation.to_val().get_payload();
+        let amt_lo = amount as u64;
+        let amt_hi = (amount >> 64) as u64;
+
+        op_bits
+            .wrapping_add(nonce)
+            .wrapping_add(amt_lo)
+            .wrapping_add(amt_hi)
+            .wrapping_add(deadline)
+            .wrapping_mul(1_000_000_007)
+    }
+
+    fn update_execution_stats(env: &Env, success: bool) {
+        let mut stats: ExecutionStats = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("STATS"))
+            .unwrap_or(ExecutionStats {
+                total_executions: 0,
+                successful_executions: 0,
+                failed_executions: 0,
+                last_execution_time: 0,
+                evicted_entries: 0,
+            });
+
+        stats.total_executions = stats.total_executions.saturating_add(1);
+        if success {
+            stats.successful_executions = stats.successful_executions.saturating_add(1);
+        } else {
+            stats.failed_executions = stats.failed_executions.saturating_add(1);
+        }
+        stats.last_execution_time = env.ledger().timestamp();
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("STATS"), &stats);
+    }
+
+    /// Clamp pagination limit: 0 → 20 (default), >MAX_AUDIT_ENTRIES → MAX_AUDIT_ENTRIES.
+    fn clamp_limit(limit: u32) -> u32 {
+        if limit == 0 {
+            20
+        } else if limit > MAX_AUDIT_ENTRIES {
+            MAX_AUDIT_ENTRIES
+        } else {
+            limit
+        }
+    }
+
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 }
+
+#[cfg(test)]
+#[path = "test.rs"]
+mod test;

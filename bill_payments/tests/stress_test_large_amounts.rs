@@ -51,6 +51,7 @@ fn test_create_bill_near_max_i128() {
         &0,
         &None,
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     let bill = client.get_bill(&bill_id).unwrap();
@@ -78,6 +79,7 @@ fn test_pay_bill_with_large_amount() {
         &0,
         &None,
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     env.mock_all_auths();
@@ -108,6 +110,7 @@ fn test_recurring_bill_with_large_amount() {
         &30,
         &None,
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     env.mock_all_auths();
@@ -145,6 +148,7 @@ fn test_get_total_unpaid_with_two_large_bills() {
         &0,
         &None,
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     env.mock_all_auths();
@@ -157,6 +161,7 @@ fn test_get_total_unpaid_with_two_large_bills() {
         &0,
         &None,
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     let total = client.get_total_unpaid(&owner);
@@ -164,8 +169,7 @@ fn test_get_total_unpaid_with_two_large_bills() {
 }
 
 #[test]
-#[should_panic(expected = "overflow")]
-fn test_get_total_unpaid_overflow_panics() {
+fn test_get_total_unpaid_saturates_on_overflow() {
     let env = Env::default();
     let contract_id = env.register_contract(None, BillPayments);
     let client = BillPaymentsClient::new(&env, &contract_id);
@@ -173,7 +177,7 @@ fn test_get_total_unpaid_overflow_panics() {
 
     env.mock_all_auths();
 
-    // Create two bills that will overflow when added
+    // Create two bills that would overflow when added normally
     let amount = i128::MAX / 2 + 1000;
 
     client.create_bill(
@@ -185,6 +189,7 @@ fn test_get_total_unpaid_overflow_panics() {
         &0,
         &None,
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     env.mock_all_auths();
@@ -197,10 +202,85 @@ fn test_get_total_unpaid_overflow_panics() {
         &0,
         &None,
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
-    // This should panic due to overflow
-    client.get_total_unpaid(&owner);
+    // get_total_unpaid should saturate instead of panicking
+    // When overflow would occur, result should be i128::MAX
+    let total = client.get_total_unpaid(&owner);
+    assert_eq!(
+        total,
+        i128::MAX,
+        "get_total_unpaid should saturate to i128::MAX on overflow, not panic"
+    );
+}
+
+#[test]
+fn test_get_total_unpaid_by_currency_saturates_on_overflow() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, BillPayments);
+    let client = BillPaymentsClient::new(&env, &contract_id);
+    let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+    env.mock_all_auths();
+
+    // Create two large bills in USDC that would overflow
+    let amount = i128::MAX / 2 + 1000;
+
+    client.create_bill(
+        &owner,
+        &String::from_str(&env, "USDC Bill 1"),
+        &amount,
+        &1000000,
+        &false,
+        &0,
+        &None,
+        &String::from_str(&env, "USDC"),
+        &None,
+    );
+
+    env.mock_all_auths();
+    client.create_bill(
+        &owner,
+        &String::from_str(&env, "USDC Bill 2"),
+        &amount,
+        &1000000,
+        &false,
+        &0,
+        &None,
+        &String::from_str(&env, "USDC"),
+        &None,
+    );
+
+    // get_total_unpaid_by_currency should saturate on overflow
+    let total = client.get_total_unpaid_by_currency(&owner, &String::from_str(&env, "USDC"));
+    assert_eq!(
+        total,
+        i128::MAX,
+        "get_total_unpaid_by_currency should saturate to i128::MAX on overflow"
+    );
+
+    // Create a XLM bill and verify it's not included in USDC total
+    env.mock_all_auths();
+    client.create_bill(
+        &owner,
+        &String::from_str(&env, "XLM Bill"),
+        &1000,
+        &1000000,
+        &false,
+        &0,
+        &None,
+        &String::from_str(&env, "XLM"),
+        &None,
+    );
+
+    // USDC total should still be saturated
+    let usdc_total = client.get_total_unpaid_by_currency(&owner, &String::from_str(&env, "USDC"));
+    assert_eq!(usdc_total, i128::MAX);
+
+    // XLM total should only include XLM bills
+    let xlm_total = client.get_total_unpaid_by_currency(&owner, &String::from_str(&env, "XLM"));
+    assert_eq!(xlm_total, 1000);
 }
 
 #[test]
@@ -225,6 +305,7 @@ fn test_multiple_large_bills_different_owners() {
         &0,
         &None,
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     env.mock_all_auths();
@@ -237,6 +318,7 @@ fn test_multiple_large_bills_different_owners() {
         &0,
         &None,
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     let total1 = client.get_total_unpaid(&owner1);
@@ -268,6 +350,7 @@ fn test_archive_large_amount_bill() {
         &0,
         &None,
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     env.mock_all_auths();
@@ -304,6 +387,7 @@ fn test_batch_pay_large_bills() {
             &0,
             &None,
             &String::from_str(&env, "XLM"),
+            &None,
         );
         bill_ids.push_back(bill_id);
         env.mock_all_auths();
@@ -371,6 +455,7 @@ fn test_edge_case_i128_max_minus_one() {
         &0,
         &None,
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     let bill = client.get_bill(&bill_id).unwrap();
@@ -399,6 +484,7 @@ fn test_pagination_with_large_amounts() {
             &0,
             &None,
             &String::from_str(&env, "XLM"),
+            &None,
         );
         env.mock_all_auths();
     }
@@ -430,7 +516,7 @@ fn test_recurring_bill_max_frequency() {
     env.mock_all_auths();
 
     // Use the maximum allowed frequency (36500 days = 100 years)
-    let max_freq = 36500; 
+    let max_freq = 36500;
 
     let bill_id = client.create_bill(
         &owner,
@@ -441,6 +527,7 @@ fn test_recurring_bill_max_frequency() {
         &max_freq,
         &None, // external_ref
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     let bill = client.get_bill(&bill_id).unwrap();
@@ -472,8 +559,9 @@ fn test_recurring_bill_frequency_overflow_protection() {
         &1000000,
         &true,
         &40000, // Greater than 36500
-        &None, // external_ref
+        &None,  // external_ref
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     // Should fail with InvalidFrequency
@@ -491,8 +579,8 @@ fn test_recurring_bill_date_overflow_protection() {
     env.mock_all_auths();
 
     // Create a bill with a due date very close to u64::MAX
-    let near_max_due = u64::MAX - 86400; 
-    
+    let near_max_due = u64::MAX - 86400;
+
     // First, we need to set the ledger time to something before due_date so create_bill succeeds
     set_time(&env, near_max_due - 1000);
 
@@ -502,15 +590,16 @@ fn test_recurring_bill_date_overflow_protection() {
         &100,
         &near_max_due,
         &true,
-        &30, // 30 days will definitely overflow if added to near_max_due
+        &30,   // 30 days will definitely overflow if added to near_max_due
         &None, // external_ref
         &String::from_str(&env, "XLM"),
+        &None,
     );
 
     // Paying this should fail due to date overflow
     env.mock_all_auths();
     let result = client.try_pay_bill(&owner, &bill_id);
-    
+
     use bill_payments::Error;
     assert_eq!(result, Err(Ok(Error::InvalidDueDate)));
 }

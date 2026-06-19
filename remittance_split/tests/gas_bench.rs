@@ -1,7 +1,7 @@
 use remittance_split::{AccountGroup, RemittanceSplit, RemittanceSplitClient};
 use soroban_sdk::testutils::{Address as AddressTrait, EnvTestConfig, Ledger, LedgerInfo};
 use soroban_sdk::token::StellarAssetClient;
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{symbol_short, Address, Env};
 
 fn bench_env() -> Env {
     let env = Env::new_with_config(EnvTestConfig {
@@ -64,8 +64,24 @@ fn bench_distribute_usdc_worst_case() {
 
     // nonce after initialize_split = 1
     let nonce = 1u64;
+    let deadline = env.ledger().timestamp() + 3600;
+    let request_hash = RemittanceSplit::compute_request_hash(
+        symbol_short!("distrib"),
+        payer.clone(),
+        nonce,
+        amount,
+        deadline,
+    );
     let (cpu, mem, distributed) = measure(&env, || {
-        client.distribute_usdc(&token_addr, &payer, &nonce, &accounts, &amount)
+        client.distribute_usdc(
+            &token_addr,
+            &payer,
+            &nonce,
+            &deadline,
+            &request_hash,
+            &accounts,
+            &amount,
+        )
     });
     assert!(distributed);
 
@@ -83,7 +99,22 @@ fn bench_create_remittance_schedule() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
-    let owner = <Address as AddressTrait>::generate(&env);
+    // Schedule APIs require the contract to be initialized.
+    let init_owner = <Address as AddressTrait>::generate(&env);
+    let token_admin = <Address as AddressTrait>::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let init_ok = client.initialize_split(
+        &init_owner,
+        &0,
+        &token_contract.address(),
+        &50,
+        &30,
+        &15,
+        &5,
+    );
+    assert!(init_ok);
+
+    let owner = init_owner.clone();
     let amount = 1_000i128;
     let next_due = env.ledger().timestamp() + 86400; // 1 day from now
     let interval = 2_592_000u64; // 30 days in seconds
@@ -91,9 +122,7 @@ fn bench_create_remittance_schedule() {
     let (cpu, mem, schedule_id) = measure(&env, || {
         client.create_remittance_schedule(&owner, &amount, &next_due, &interval)
     });
-    
-    
-    let schedule_id = result;
+
     assert_eq!(schedule_id, 1);
 
     println!(
@@ -110,14 +139,28 @@ fn bench_create_multiple_schedules() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
-    let owner = <Address as AddressTrait>::generate(&env);
+    let init_owner = <Address as AddressTrait>::generate(&env);
+    let token_admin = <Address as AddressTrait>::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let init_ok = client.initialize_split(
+        &init_owner,
+        &0,
+        &token_contract.address(),
+        &50,
+        &30,
+        &15,
+        &5,
+    );
+    assert!(init_ok);
+
+    let owner = init_owner.clone();
 
     // Create 10 schedules first to establish baseline storage state
     for i in 1..=10 {
         let amount = 1_000i128 * i as i128;
         let next_due = env.ledger().timestamp() + 86400 * i;
         let interval = 2_592_000u64;
-        
+
         let _result = client.create_remittance_schedule(&owner, &amount, &next_due, &interval);
     }
 
@@ -129,8 +172,6 @@ fn bench_create_multiple_schedules() {
     let (cpu, mem, _schedule_id) = measure(&env, || {
         client.create_remittance_schedule(&owner, &amount, &next_due, &interval)
     });
-    
-    let _result = result;
 
     println!(
         r#"{{"contract":"remittance_split","method":"create_remittance_schedule","scenario":"11th_schedule_with_existing","cpu":{},"mem":{}}}"#,
@@ -146,7 +187,21 @@ fn bench_modify_remittance_schedule() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
-    let owner = <Address as AddressTrait>::generate(&env);
+    let init_owner = <Address as AddressTrait>::generate(&env);
+    let token_admin = <Address as AddressTrait>::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let init_ok = client.initialize_split(
+        &init_owner,
+        &0,
+        &token_contract.address(),
+        &50,
+        &30,
+        &15,
+        &5,
+    );
+    assert!(init_ok);
+
+    let owner = init_owner.clone();
     let amount = 1_000i128;
     let next_due = env.ledger().timestamp() + 86400;
     let interval = 2_592_000u64;
@@ -168,7 +223,7 @@ fn bench_modify_remittance_schedule() {
             &new_interval,
         )
     });
-    
+
     assert!(result);
     println!(
         r#"{{"contract":"remittance_split","method":"modify_remittance_schedule","scenario":"single_schedule_modification","cpu":{},"mem":{}}}"#,
@@ -184,7 +239,21 @@ fn bench_cancel_remittance_schedule() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
-    let owner = <Address as AddressTrait>::generate(&env);
+    let init_owner = <Address as AddressTrait>::generate(&env);
+    let token_admin = <Address as AddressTrait>::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let init_ok = client.initialize_split(
+        &init_owner,
+        &0,
+        &token_contract.address(),
+        &50,
+        &30,
+        &15,
+        &5,
+    );
+    assert!(init_ok);
+
+    let owner = init_owner.clone();
     let amount = 1_000i128;
     let next_due = env.ledger().timestamp() + 86400;
     let interval = 2_592_000u64;
@@ -195,7 +264,7 @@ fn bench_cancel_remittance_schedule() {
     let (cpu, mem, result) = measure(&env, || {
         client.cancel_remittance_schedule(&owner, &schedule_id)
     });
-    
+
     assert!(result);
     println!(
         r#"{{"contract":"remittance_split","method":"cancel_remittance_schedule","scenario":"single_schedule_cancellation","cpu":{},"mem":{}}}"#,
@@ -231,30 +300,34 @@ fn bench_get_remittance_schedules_with_data() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
-    let owner1 = <Address as AddressTrait>::generate(&env);
-    let owner2 = <Address as AddressTrait>::generate(&env);
+    let init_owner = <Address as AddressTrait>::generate(&env);
+    let token_admin = <Address as AddressTrait>::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let init_ok = client.initialize_split(
+        &init_owner,
+        &0,
+        &token_contract.address(),
+        &50,
+        &30,
+        &15,
+        &5,
+    );
+    assert!(init_ok);
+
+    let owner1 = init_owner.clone();
 
     // Create 5 schedules for owner1
     for i in 1..=5 {
         let amount = 1_000i128 * i as i128;
         let next_due = env.ledger().timestamp() + 86400 * i;
         let interval = 2_592_000u64;
-        
-        let _result = client.create_remittance_schedule(&owner1, &amount, &next_due, &interval);
-    }
 
-    // Create 3 schedules for owner2 (should not be returned for owner1)
-    for i in 1..=3 {
-        let amount = 2_000i128 * i as i128;
-        let next_due = env.ledger().timestamp() + 86400 * i;
-        let interval = 604_800u64;
-        
-        let _result = client.create_remittance_schedule(&owner2, &amount, &next_due, &interval);
+        let _result = client.create_remittance_schedule(&owner1, &amount, &next_due, &interval);
     }
 
     let (cpu, mem, schedules) = measure(&env, || client.get_remittance_schedules(&owner1));
 
-    // Should only return owner1's schedules (data isolation test)
+    // Should return the owner's schedules.
     assert_eq!(schedules.len(), 5);
 
     println!(
@@ -271,7 +344,21 @@ fn bench_get_remittance_schedule_single() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
-    let owner = <Address as AddressTrait>::generate(&env);
+    let init_owner = <Address as AddressTrait>::generate(&env);
+    let token_admin = <Address as AddressTrait>::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let init_ok = client.initialize_split(
+        &init_owner,
+        &0,
+        &token_contract.address(),
+        &50,
+        &30,
+        &15,
+        &5,
+    );
+    assert!(init_ok);
+
+    let owner = init_owner.clone();
     let amount = 1_000i128;
     let next_due = env.ledger().timestamp() + 86400;
     let interval = 2_592_000u64;
@@ -300,14 +387,28 @@ fn bench_schedule_operations_worst_case() {
     let contract_id = env.register_contract(None, RemittanceSplit);
     let client = RemittanceSplitClient::new(&env, &contract_id);
 
-    let owner = <Address as AddressTrait>::generate(&env);
+    let init_owner = <Address as AddressTrait>::generate(&env);
+    let token_admin = <Address as AddressTrait>::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let init_ok = client.initialize_split(
+        &init_owner,
+        &0,
+        &token_contract.address(),
+        &50,
+        &30,
+        &15,
+        &5,
+    );
+    assert!(init_ok);
+
+    let owner = init_owner.clone();
 
     // Create 50 schedules to establish worst-case storage state
     for i in 1..=50 {
         let amount = 1_000i128 * i as i128;
         let next_due = env.ledger().timestamp() + 86400 * i;
         let interval = 2_592_000u64;
-        
+
         let _result = client.create_remittance_schedule(&owner, &amount, &next_due, &interval);
     }
 

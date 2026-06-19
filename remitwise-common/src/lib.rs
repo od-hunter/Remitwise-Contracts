@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use soroban_sdk::{contracttype, symbol_short, Symbol};
 
@@ -36,7 +37,10 @@ pub enum CoverageType {
     Liability = 5,
 }
 
-/// Event categories for logging
+/// Event categories used for logging across all contracts.
+///
+/// Determines the high-level classification of an event. The taxonomy is documented in
+/// `docs/EVENT_TAXONOMY.md`.
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(u32)]
@@ -48,7 +52,9 @@ pub enum EventCategory {
     Access = 4,
 }
 
-/// Event priorities for logging
+/// Priority levels for events emitted by contracts.
+/// Determines the importance of the event. Lower numbers represent lower priority.
+/// See `docs/EVENT_TAXONOMY.md` for full taxonomy details.
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(u32)]
@@ -74,6 +80,20 @@ impl EventPriority {
 pub const DEFAULT_PAGE_LIMIT: u32 = 20;
 pub const MAX_PAGE_LIMIT: u32 = 50;
 
+/// Standardized TTL Constants (Ledger Counts)
+pub const DAY_IN_LEDGERS: u32 = 17280; // ~5 seconds per ledger
+
+/// Storage TTL constants for active data
+pub const INSTANCE_LIFETIME_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS; // 7 days
+pub const INSTANCE_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS; // 30 days
+
+/// Storage TTL constants for persistent data
+pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = 15 * DAY_IN_LEDGERS; // 15 days
+pub const PERSISTENT_BUMP_AMOUNT: u32 = 60 * DAY_IN_LEDGERS; // 60 days
+
+/// Storage TTL constants for archived data
+pub const ARCHIVE_LIFETIME_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS; // 7 days
+pub const ARCHIVE_BUMP_AMOUNT: u32 = 180 * DAY_IN_LEDGERS; // 180 days (6 months)
 
 /// Signature expiration time (24 hours in seconds)
 pub const SIGNATURE_EXPIRATION: u64 = 86400;
@@ -84,46 +104,12 @@ pub const CONTRACT_VERSION: u32 = 1;
 /// Maximum batch size for operations
 pub const MAX_BATCH_SIZE: u32 = 50;
 
-/// Helper function to clamp limit
+/// Clamps a pagination limit to ensure it falls within the allowed boundaries.
 ///
-/// # Behavior Contract
-///
-/// `clamp_limit` normalises a caller-supplied page-size value so that every
-/// pagination call in the workspace uses a consistent, bounded limit.
-///
-/// ## Rules (in evaluation order)
-///
-/// | Input condition          | Returned value        | Rationale                                      |
-/// |--------------------------|----------------------|------------------------------------------------|
-/// | `limit == 0`             | `DEFAULT_PAGE_LIMIT` | Zero is treated as "use the default".          |
-/// | `limit > MAX_PAGE_LIMIT` | `MAX_PAGE_LIMIT`     | Cap to prevent unbounded storage reads.        |
-/// | otherwise                | `limit`              | Caller value is within the valid range.        |
-///
-/// ## Invariants
-///
-/// - The return value is always in the range `[1, MAX_PAGE_LIMIT]`.
-/// - `clamp_limit(0) == DEFAULT_PAGE_LIMIT` (default substitution).
-/// - `clamp_limit(MAX_PAGE_LIMIT) == MAX_PAGE_LIMIT` (boundary is inclusive).
-/// - `clamp_limit(MAX_PAGE_LIMIT + 1) == MAX_PAGE_LIMIT` (cap is enforced).
-/// - The function is pure and has no side effects.
-///
-/// ## Security Assumptions
-///
-/// - Callers must not rely on receiving a value larger than `MAX_PAGE_LIMIT`.
-/// - A zero input is **not** an error; it is silently replaced with the default.
-///   Contracts that need to distinguish "no limit requested" from "default limit"
-///   should inspect the raw input before calling this function.
-///
-/// ## Usage
-///
-/// ```rust
-/// use remitwise_common::{clamp_limit, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
-///
-/// assert_eq!(clamp_limit(0),                  DEFAULT_PAGE_LIMIT);
-/// assert_eq!(clamp_limit(10),                 10);
-/// assert_eq!(clamp_limit(MAX_PAGE_LIMIT),     MAX_PAGE_LIMIT);
-/// assert_eq!(clamp_limit(MAX_PAGE_LIMIT + 1), MAX_PAGE_LIMIT);
-/// ```
+/// # Behavior
+/// - `0` is treated as a request for the default limit and returns `DEFAULT_PAGE_LIMIT`.
+/// - Values between `1` and `MAX_PAGE_LIMIT` (inclusive) are passed through unchanged.
+/// - Values greater than `MAX_PAGE_LIMIT` are capped at `MAX_PAGE_LIMIT`.
 pub fn clamp_limit(limit: u32) -> u32 {
     if limit == 0 {
         DEFAULT_PAGE_LIMIT
@@ -134,41 +120,96 @@ pub fn clamp_limit(limit: u32) -> u32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tag canonicalization
+// ---------------------------------------------------------------------------
+
+/// Maximum allowed byte length for a single tag.
+pub const TAG_MAX_LEN: u32 = 32;
+
+/// Validates and canonicalizes a batch of tags.
+///
+/// # Rules
+/// - The batch must contain at least one tag (`panic!("Tags cannot be empty")`).
+/// - Each tag must be between 1 and `TAG_MAX_LEN` bytes inclusive
+///   (`panic!("Tag must be between 1 and 32 characters")`).
+/// - Allowed charset: `[a-z0-9\-_]`.  ASCII uppercase letters are silently
+///   folded to lowercase; any other byte causes the supplied `on_invalid_char`
+///   closure to be called (typically `panic_with_error!` or `panic!`).
+///
+/// # Returns
+/// A new `Vec<String>` containing the normalized (lowercased) tags in the
+/// same order as the input.
+///
+/// # Usage
+/// ```ignore
+/// use remitwise_common::canonicalize_tags;
+/// let normalized = canonicalize_tags(&env, &tags, || {
+///     soroban_sdk::panic_with_error!(&env, MyError::InvalidTagContent)
+/// });
+/// ```
+pub fn canonicalize_tags<F>(
+    env: &soroban_sdk::Env,
+    tags: &soroban_sdk::Vec<soroban_sdk::String>,
+    on_invalid_char: F,
+) -> soroban_sdk::Vec<soroban_sdk::String>
+where
+    F: Fn(),
+{
+    if tags.is_empty() {
+        panic!("Tags cannot be empty");
+    }
+    let mut out = soroban_sdk::Vec::new(env);
+    for tag in tags.iter() {
+        let len = tag.len();
+        if len == 0 || len > TAG_MAX_LEN {
+            panic!("Tag must be between 1 and 32 characters");
+        }
+        let mut buf = [0u8; 32];
+        tag.copy_into_slice(&mut buf[..len as usize]);
+        for byte in buf.iter_mut().take(len as usize) {
+            if byte.is_ascii_uppercase() {
+                *byte += b'a' - b'A';
+            }
+            let b = *byte;
+            if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') {
+                on_invalid_char();
+            }
+        }
+        let s = match core::str::from_utf8(&buf[..len as usize]) {
+            Ok(v) => v,
+            Err(_) => {
+                on_invalid_char();
+                // on_invalid_char must diverge (panic); this is unreachable.
+                ""
+            }
+        };
+        out.push_back(soroban_sdk::String::from_str(env, s));
+    }
+    out
+}
+
 /// Event emission helper
-///
-/// # Deterministic topic naming
-///
-/// All events emitted via `RemitwiseEvents` follow a deterministic topic schema:
-///
-/// 1. A fixed namespace symbol: `"Remitwise"`.
-/// 2. An event category as `u32` (see `EventCategory`).
-/// 3. An event priority as `u32` (see `EventPriority`).
-/// 4. An action `Symbol` describing the specific event or a subtype (e.g. `"created"`).
-///
-/// This ordering allows consumers to index and filter events reliably across contracts.
 pub struct RemitwiseEvents;
 
 impl RemitwiseEvents {
-    /// Emit a single event with deterministic topics.
-    ///
-    /// # Parameters
-    /// - `env`: Soroban environment used to publish the event.
-    /// - `category`: Logical event category (`EventCategory`).
-    /// - `priority`: Event priority (`EventPriority`).
-    /// - `action`: A `Symbol` identifying the action or event name.
-    /// - `data`: The serializable payload for the event.
-    ///
-    /// # Security
-    /// Do not include sensitive personal data in `data` because events are publicly visible on-chain.
-    pub fn emit<T>(
-        env: &soroban_sdk::Env,
-        category: EventCategory,
-        priority: EventPriority,
-        action: Symbol,
-        data: T,
-    ) where
-        T: soroban_sdk::IntoVal<soroban_sdk::Env, soroban_sdk::Val>,
-    {
+    /// Emits a single event with the given category, priority, and action.
+///
+/// * `category` – The `EventCategory` describing the type of event.
+/// * `priority` – The `EventPriority` indicating the importance level.
+/// * `action` – A short `Symbol` identifying the specific action.
+/// * `data` – The event payload implementing `IntoVal`.
+///
+/// The emitted event follows the topic schema defined in `docs/EVENT_TAXONOMY.md`.
+pub fn emit<T>(
+    env: &soroban_sdk::Env,
+    category: EventCategory,
+    priority: EventPriority,
+    action: Symbol,
+    data: T,
+) where
+    T: soroban_sdk::IntoVal<soroban_sdk::Env, soroban_sdk::Val>,
+{
         let topics = (
             symbol_short!("Remitwise"),
             category.to_u32(),
@@ -178,11 +219,14 @@ impl RemitwiseEvents {
         env.events().publish(topics, data);
     }
 
-    /// Emit a small batch-style event indicating bulk operations.
-    ///
-    /// The `action` parameter is included in the payload rather than as the final topic
-    /// to make the topic schema consistent for batch analytics.
-    pub fn emit_batch(env: &soroban_sdk::Env, category: EventCategory, action: Symbol, count: u32) {
+    /// Emits a batch event for the given category and action with a count.
+///
+/// * `category` – The `EventCategory` of the batched events.
+/// * `action` – Symbol representing the batch action.
+/// * `count` – Number of events in the batch.
+///
+/// This always uses `EventPriority::Low` for batch events.
+pub fn emit_batch(env: &soroban_sdk::Env, category: EventCategory, action: Symbol, count: u32) {
         let topics = (
             symbol_short!("Remitwise"),
             category.to_u32(),
@@ -193,15 +237,3 @@ impl RemitwiseEvents {
         env.events().publish(topics, data);
     }
 }
-
-// Standardized TTL Constants (Ledger Counts)
-pub const DAY_IN_LEDGERS: u32 = 17280; // ~5 seconds per ledger
-
-pub const INSTANCE_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS; // 30 days
-pub const INSTANCE_LIFETIME_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS; // 7 days
-
-pub const PERSISTENT_BUMP_AMOUNT: u32 = 60 * DAY_IN_LEDGERS; // 60 days
-pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = 15 * DAY_IN_LEDGERS; // 15 days
-
-pub const ARCHIVE_BUMP_AMOUNT: u32 = 150 * DAY_IN_LEDGERS; // ~150 days
-pub const ARCHIVE_LIFETIME_THRESHOLD: u32 = 1 * DAY_IN_LEDGERS; // 1 day
