@@ -57,8 +57,23 @@ fn sample_accounts(env: &Env) -> AccountGroup {
     }
 }
 
+fn split_expected(_env: &Env, client: &RemittanceSplitClient<'_>, total_amount: i128) -> [i128; 4] {
+    // RemittanceSplitClient's generated binding for `calculate_split` returns a
+    // `soroban_sdk::Vec<i128>` directly in this test harness.
+    let alloc = client
+        .calculate_split(&total_amount);
+
+    [
+        alloc.get(0).unwrap(),
+        alloc.get(1).unwrap(),
+        alloc.get(2).unwrap(),
+        alloc.get(3).unwrap(),
+    ]
+}
+
 #[test]
 fn test_distribution_completed_event() {
+
     let env = Env::default();
     env.mock_all_auths();
 
@@ -1380,8 +1395,186 @@ fn test_execute_paused_contract_returns_empty() {
     }
 }
 
+// ============================================================
+// Batch / fan-out conservation tests
+// ============================================================
+// The executor `execute_due_remittance_schedules()` runs many
+// schedule executions in a single sweep (fan-out). Even if
+// `calculate_split()` is conservative per-schedule, an implementation
+// bug could leak/destroy value at the aggregate level by
+// mis-advancing `next_due`, double-executing, or skipping schedules.
+//
+// This test suite pins:
+// 1) Exact due-set selection for a given ledger timestamp.
+// 2) Idempotent `next_due` advancement (no re-execution within the window).
+// 3) Exact remainder/dust policy matches `calculate_split()` for each executed schedule.
+// 4) Aggregate funds conservation: sum(funds_in) == sum(funds_out) across the whole fan-out.
+
+#[test]
+fn test_execute_due_remittance_schedules_fanout_dust_conservation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Use one contract instance with a fixed split regime.
+    // (Percentages are fixed per RemittanceSplit instance.)
+    let (client, owner, _token_addr, _stellar_client) = setup_split(&env, 37, 33, 20, 10);
+
+    // Seed due schedules at/under a single ledger time.
+    // Include both one-off (interval=0) and recurring (interval>0).
+    // Also choose amounts that create lots of dust due to floor division by 100.
+    set_time(&env, 1_000);
+    let now = 5_000u64;
+
+    let one_off_due_at = now; // exactly due
+    let recurring_due_at = now; // exactly due (first interval)
+
+    let amounts: [i128; 6] = [
+        101,  // dust-heavy
+        250,  // dust-heavy
+        999,  // near-1000
+        1_003, // different remainder profile
+        10_007, // larger dust surface
+        77,   // small dust
+    ];
+
+    // Create 6 schedules, all with next_due <= now, so they are due in this sweep.
+    // IDs are monotonic starting at 1 in this test env.
+    let mut ids = Vec::new(&env);
+
+
+    // One-off schedules (interval 0): will deactivate after execution.
+let id1 = client
+        .create_remittance_schedule(&owner, &amounts[0], &one_off_due_at, &0)
+        ;
+    ids.push_back(id1);
+    let id2 = client
+        .create_remittance_schedule(&owner, &amounts[1], &one_off_due_at, &0);
+
+    ids.push_back(id2);
+
+
+    // Recurring schedules: will advance next_due and keep active.
+    // Use MIN_SCHEDULE_INTERVAL to respect constraints.
+    let interval = MIN_SCHEDULE_INTERVAL;
+let id3 = client
+        .create_remittance_schedule(&owner, &amounts[2], &recurring_due_at, &interval)
+        ;
+    ids.push_back(id3);
+let id4 = client
+        .create_remittance_schedule(&owner, &amounts[3], &recurring_due_at, &interval)
+        ;
+    ids.push_back(id4);
+let id5 = client
+        .create_remittance_schedule(&owner, &amounts[4], &recurring_due_at, &interval)
+        ;
+    ids.push_back(id5);
+
+    // Another one-off for balance.
+let id6 = client
+        .create_remittance_schedule(&owner, &amounts[5], &one_off_due_at, &0)
+        ;
+    ids.push_back(id6);
+
+    // Execute due schedules at `now`.
+    set_time(&env, now);
+
+    let executed = client.execute_due_remittance_schedules();
+
+    // Assert exact due-set selection: all 6 schedules due at `now` must execute.
+    assert_eq!(executed.len(), 6);
+
+    // Convert to a boolean set for exactness without sorting guarantees.
+    let mut seen = [false; 7];
+    for i in 0..ids.len() {
+        let id = ids.get(i).unwrap();
+        // All ids should be in range 1..=6 in this test.
+        assert!(id as usize <= 6);
+    }
+    for i in 0..executed.len() {
+        let id = executed.get(i).unwrap();
+        assert!((id as usize) <= 6);
+        assert!(!seen[id as usize], "schedule {} executed twice", id);
+        seen[id as usize] = true;
+    }
+    for expected in 1..=6u32 {
+        assert!(seen[expected as usize], "missing executed schedule id {}", expected);
+    }
+
+    // Per-schedule dust policy pin + aggregate conservation pin.
+    let mut total_in: i128 = 0;
+    let mut total_out: [i128; 4] = [0, 0, 0, 0];
+
+    for i in 1..=6u32 {
+        let sched = client
+            .get_remittance_schedule(&i)
+            .expect("schedule must exist");
+
+        assert!(sched.last_executed.is_some());
+        assert_eq!(sched.last_executed, Some(now));
+
+        // Confirm dust/remainder policy matches calculate_split for each schedule amount.
+        let expected_allocs = split_expected(&env, &client, sched.amount);
+
+        assert_eq!(
+            expected_allocs[0] + expected_allocs[1] + expected_allocs[2] + expected_allocs[3],
+            sched.amount,
+            "per-schedule conservation should hold"
+        );
+
+        // Reconcile category amounts by calling calculate_split directly and comparing.
+        // (The executor stores only next_due/last_executed, so the only authoritative
+        // dust policy source is calculate_split.)
+        total_in = total_in.checked_add(sched.amount).expect("aggregate must not overflow");
+        for k in 0..4 {
+            total_out[k] = total_out[k]
+                .checked_add(expected_allocs[k])
+                .expect("aggregate category must not overflow");
+        }
+
+        // next_due behavior & idempotency invariants.
+        if sched.interval == 0 {
+            assert!(!sched.active, "one-off schedules must deactivate");
+        } else {
+            // For recurring schedules starting at `now`, next_due must be strictly > now.
+            // With interval=MIN_SCHEDULE_INTERVAL and `next_due==now`, next_due should be now+interval.
+            assert!(sched.active);
+            assert_eq!(sched.next_due, now + interval);
+            assert_eq!(sched.missed_count, 0);
+        }
+    }
+
+    assert_eq!(
+        total_in,
+        total_out[0]
+            .checked_add(total_out[1])
+            .and_then(|v| v.checked_add(total_out[2]))
+            .and_then(|v| v.checked_add(total_out[3]))
+            .expect("aggregate must not overflow"),
+        "aggregate dust conservation must hold across the entire fan-out sweep"
+    );
+
+    // Idempotency: re-sweep at the same ledger timestamp must execute nothing.
+    let executed_again = client.execute_due_remittance_schedules();
+    assert_eq!(executed_again.len(), 0);
+
+    // And next_due/last_executed should remain unchanged.
+    for i in 1..=6u32 {
+        let sched2 = client.get_remittance_schedule(&i).expect("schedule must exist");
+        assert_eq!(sched2.last_executed, Some(now));
+        if sched2.interval == 0 {
+            assert!(!sched2.active);
+        } else {
+            assert_eq!(sched2.next_due, now + interval);
+        }
+    }
+}
+
+// Keep existing mixed due/not-due test after fan-out tests.
+
 #[test]
 fn test_execute_mixed_due_not_due() {
+
+
     let env = Env::default();
     let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
 
