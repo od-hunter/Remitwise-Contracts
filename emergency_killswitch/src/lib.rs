@@ -563,11 +563,7 @@ mod transfer_admin_tests {
 #[cfg(test)]
 mod pause_function_cap_tests {
     use super::*;
-    use soroban_sdk::{
-        symbol_short,
-        testutils::Address as _,
-        Address, Env,
-    };
+    use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env};
 
     /// Distinct function symbols used to fill per-module pause slots in order.
     const DISTINCT_FUNCS: &[&str] = &[
@@ -646,8 +642,7 @@ mod pause_function_cap_tests {
 
         assert_eq!(h.count_paused(&h.module), MAX_PAUSED_FUNCTIONS);
         assert_eq!(
-            h.client
-                .try_pause_function(&h.module, &h.overflow_func()),
+            h.client.try_pause_function(&h.module, &h.overflow_func()),
             Err(Ok(Error::LimitExceeded))
         );
         assert_eq!(h.count_paused(&h.module), MAX_PAUSED_FUNCTIONS);
